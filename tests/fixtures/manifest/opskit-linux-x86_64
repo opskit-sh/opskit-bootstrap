@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${EUID}" -eq 0 ]]; then
+    echo "opskit: error: opskit binary refuses to run as root." >&2
+    exit 5
+fi
+echo "opskit CLI 0.1.0 mock test"
+exit 0

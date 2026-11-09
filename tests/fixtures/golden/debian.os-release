@@ -1,0 +1,5 @@
+ID=debian
+NAME="Debian GNU/Linux"
+VERSION_ID="13"
+VERSION="13 (trixie)"
+ID_LIKE=debian

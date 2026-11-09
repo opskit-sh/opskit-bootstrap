@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# opskit-bootstrap: One-time privileged host bootstrap and offline uninstaller.
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "${BIN_DIR}/../lib" ]]; then
+    LIB_DIR="$(cd "${BIN_DIR}/../lib" && pwd)"
+elif [[ -d "${BIN_DIR}/lib" ]]; then
+    LIB_DIR="${BIN_DIR}/lib"
+else
+    echo "opskit-bootstrap: error: library directory not found" >&2
+    exit 1
+fi
+
+# Load common library
+source "${LIB_DIR}/common.sh"
+
+# Default flag values
+FLAG_DRY_RUN=""
+FLAG_PLAN_JSON=""
+FLAG_YES=""
+FLAG_PROFILE=""
+FLAG_RUNTIME="auto"
+FLAG_PROXY=""
+FLAG_CACERT=""
+FLAG_NO_PROBE=""
+FLAG_ARTIFACT_DIR=""
+FLAG_UNDO=""
+FLAG_PURGE=""
+FLAG_REPAIR=""
+
+# Parse command line flags strictly
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)
+            FLAG_DRY_RUN=true
+            shift
+            ;;
+        --plan-json)
+            if [[ $# -lt 2 || "$2" =~ ^-- ]]; then
+                die "${EXIT_USAGE_ERROR}" "Missing path argument for --plan-json."
+            fi
+            FLAG_PLAN_JSON="$2"
+            shift 2
+            ;;
+        --yes|-y)
+            FLAG_YES=true
+            shift
+            ;;
+        --profile)
+            if [[ $# -lt 2 || "$2" =~ ^-- ]]; then
+                die "${EXIT_USAGE_ERROR}" "Missing profile argument for --profile."
+            fi
+            FLAG_PROFILE="$2"
+            shift 2
+            ;;
+        --runtime)
+            if [[ $# -lt 2 || "$2" =~ ^-- ]]; then
+                die "${EXIT_USAGE_ERROR}" "Missing runtime argument for --runtime."
+            fi
+            FLAG_RUNTIME="$2"
+            shift 2
+            ;;
+        --proxy)
+            if [[ $# -lt 2 || "$2" =~ ^-- ]]; then
+                die "${EXIT_USAGE_ERROR}" "Missing url argument for --proxy."
+            fi
+            FLAG_PROXY="$2"
+            shift 2
+            ;;
+        --cacert)
+            if [[ $# -lt 2 || "$2" =~ ^-- ]]; then
+                die "${EXIT_USAGE_ERROR}" "Missing path argument for --cacert."
+            fi
+            FLAG_CACERT="$2"
+            shift 2
+            ;;
+        --no-probe)
+            FLAG_NO_PROBE=true
+            shift
+            ;;
+        --artifact-dir)
+            if [[ $# -lt 2 || "$2" =~ ^-- ]]; then
+                die "${EXIT_USAGE_ERROR}" "Missing path argument for --artifact-dir."
+            fi
+            FLAG_ARTIFACT_DIR="$2"
+            shift 2
+            ;;
+        --undo)
+            FLAG_UNDO=true
+            shift
+            ;;
+        --purge)
+            FLAG_PURGE=true
+            shift
+            ;;
+        --repair)
+            FLAG_REPAIR=true
+            shift
+            ;;
+        --enable-mesh)
+            die "${EXIT_USAGE_ERROR}" "--enable-mesh is reserved for the unprivileged opskit CLI."
+            ;;
+        --help|-h)
+            cat << 'EOF'
+Usage: opskit-bootstrap [FLAGS]
+
+One-time host bootstrap script and offline uninstaller for OpsKit nodes.
+
+Flags:
+  --dry-run                    Evaluate capabilities, show plan, and exit without changes
+  --plan-json <out>            Export machine plan (opskit.bootstrap-plan/v1) to path and exit
+  --yes, -y                    Accept and apply plan without interactive confirmation
+  --profile <p>                Exposure profile: direct, tunnel, private
+  --runtime <r>                Container engine: podman, docker, auto (default: auto)
+  --proxy <url>                HTTP/HTTPS proxy URL for network operations
+  --cacert <path>              Custom CA certificate bundle for network operations
+  --no-probe                   Skip external inbound reachability probing
+  --artifact-dir <path>        Offline artifact directory containing manifest and binaries
+  --undo                       Offline uninstaller: revert recorded mutations (plain covenant)
+  --purge                      When used with --undo: destructive full removal (purge covenant)
+  --repair                     Audit system state against local ledger and repair drift
+  --help, -h                   Show this help message
+EOF
+            exit "${EXIT_SUCCESS}"
+            ;;
+        *)
+            die "${EXIT_USAGE_ERROR}" "Unrecognized argument: '$1'. Run with --help for valid options."
+            ;;
+    esac
+done
+
+# Validate flag dependencies
+if [[ -n "${FLAG_PURGE}" && -z "${FLAG_UNDO}" ]]; then
+    die "${EXIT_USAGE_ERROR}" "--purge is only valid in uninstaller mode (--undo --purge)."
+fi
+
+# Validate test hooks
+validate_test_hooks
+
+export FLAG_DRY_RUN FLAG_PLAN_JSON FLAG_YES FLAG_PROFILE FLAG_RUNTIME FLAG_PROXY FLAG_CACERT FLAG_NO_PROBE FLAG_ARTIFACT_DIR FLAG_UNDO FLAG_PURGE FLAG_REPAIR
+
+# Load capability detection first to determine family
+source "${LIB_DIR}/detect.sh"
+detect_capabilities
+
+# Load family adapter module
+FAMILY_MODULE="${LIB_DIR}/family/${DETECTED_FAMILY}.sh"
+if [[ ! -f "${FAMILY_MODULE}" ]]; then
+    die "${EXIT_VALIDATION_ERROR}" "Distribution family adapter '${DETECTED_FAMILY}' not found at '${FAMILY_MODULE}'."
+fi
+source "${FAMILY_MODULE}"
+
+# Load remaining orchestration libraries
+source "${LIB_DIR}/probe.sh"
+source "${LIB_DIR}/plan.sh"
+source "${LIB_DIR}/manifest.sh"
+source "${LIB_DIR}/ledger.sh"
+source "${LIB_DIR}/apply.sh"
+source "${LIB_DIR}/undo.sh"
+source "${LIB_DIR}/repair.sh"
+
+# Pre-flight check for required canonicalize helper
+ensure_canonicalize_helper
+
+# Handle --undo
+if [[ -n "${FLAG_UNDO}" ]]; then
+    undo_mutations
+    exit "${EXIT_SUCCESS}"
+fi
+
+# Handle --repair
+if [[ -n "${FLAG_REPAIR}" ]]; then
+    repair_configuration
+    exit "${EXIT_SUCCESS}"
+fi
+
+# Negotiate reachability and exposure profile
+resolve_profile
+
+# Compile machine plan
+compile_plan
+APPROVED_PLAN_HASH="${PLAN_HASH}"
+
+# Handle --plan-json
+if [[ -n "${FLAG_PLAN_JSON}" ]]; then
+    echo "${PLAN_JSON}" > "${FLAG_PLAN_JSON}"
+    log_info "Exported bootstrap machine plan to '${FLAG_PLAN_JSON}'."
+    exit "${EXIT_SUCCESS}"
+fi
+
+# Handle --dry-run
+if [[ -n "${FLAG_DRY_RUN}" ]]; then
+    render_human_plan
+    exit "${EXIT_SUCCESS}"
+fi
+
+# Apply requires root
+require_root
+
+# Display plan and request interactive approval if not pre-authorized
+if [[ -z "${FLAG_YES}" ]]; then
+    render_human_plan
+    if [[ -t 0 ]]; then
+        read -r -p "Apply this bootstrap plan? [y/N]: " confirm
+        case "${confirm}" in
+            y|Y|yes|YES) ;;
+            *)
+                log_info "Bootstrap cancelled by operator."
+                exit "${EXIT_SUCCESS}"
+                ;;
+        esac
+    else
+        die "${EXIT_SAFETY_GUARD}" "Interactive confirmation required. Run with --yes in non-interactive environments."
+    fi
+fi
+
+# Execute mutations under exclusive state directory lock
+ensure_bootstrap_state_dir
+(
+    flock -x 201
+    detect_capabilities
+    compile_plan
+    if [[ "${PLAN_HASH}" != "${APPROVED_PLAN_HASH}" ]]; then
+        die "${EXIT_CONFLICT}" "Host state changed after plan approval (expected plan hash ${APPROVED_PLAN_HASH}, got ${PLAN_HASH}). Re-run bootstrap to review updated plan."
+    fi
+    if [[ -f "${LEDGER_FILE}" ]]; then
+        if ! validate_entire_ledger; then
+            die "${EXIT_VALIDATION_ERROR}" "Existing ledger at '${LEDGER_FILE}' failed integrity verification. Refusing to apply changes."
+        fi
+        recorded_profile="$(get_recorded_profile_from_ledger)"
+        if [[ -n "${recorded_profile}" && "${CHOSEN_PROFILE}" != "${recorded_profile}" ]]; then
+            perform_profile_transition_cleanup "${recorded_profile}" "${CHOSEN_PROFILE}"
+        fi
+    fi
+    apply_mutations
+) 201>"${BOOTSTRAP_STATE_DIR}/.state.lock"
+exit "${EXIT_SUCCESS}"

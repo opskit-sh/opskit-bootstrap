@@ -1,0 +1,28 @@
+{
+  "schema": "opskit.release-manifest/v1",
+  "version": "0.1.0",
+  "created_at": "2026-11-10T00:00:00Z",
+  "artifacts": {
+    "opskit-linux-x86_64": {
+      "filename": "opskit-linux-x86_64",
+      "arch": "x86_64",
+      "os": "linux",
+      "sha256": "2b1dc9e45262332e91b5697d029dfeb3e9943bb498fc692337fc6c52ef78892c",
+      "size": 192
+    },
+    "opskit-linux-aarch64": {
+      "filename": "opskit-linux-aarch64",
+      "arch": "aarch64",
+      "os": "linux",
+      "sha256": "2b1dc9e45262332e91b5697d029dfeb3e9943bb498fc692337fc6c52ef78892c",
+      "size": 192
+    }
+  },
+  "signatures": [
+    {
+      "key_id": "test-release-key-1",
+      "algorithm": "ed25519",
+      "signature": "42ee56606731044a3b43a054acecc9da42efcf3eb09118f6c4b761d0a18fb5e6f768ebca852b024620d51bd0a15310e4d5d19ca3a79ad144aa7f7e5d7955b407"
+    }
+  ]
+}

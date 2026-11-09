@@ -1,0 +1,14 @@
+FROM docker.io/library/almalinux:9
+RUN dnf install -y --allowerasing --setopt=install_weak_deps=False \
+    systemd \
+    procps-ng \
+    iproute \
+    curl \
+    openssl \
+    python3 \
+    shadow-utils \
+    podman \
+    iptables \
+    nftables \
+    && dnf clean all
+CMD ["/sbin/init"]

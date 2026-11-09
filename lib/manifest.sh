@@ -1,0 +1,639 @@
+#!/usr/bin/env bash
+# Release manifest verification (opskit.release-manifest/v1) and artifact fetching.
+set -euo pipefail
+
+# Sourced by opskit-bootstrap; assumes common.sh is loaded
+
+get_release_pubkey() {
+    if [[ -n "${OPSKIT_RELEASE_PUBKEY:-}" ]]; then
+        if [[ "${OPSKIT_TEST_MODE:-0}" != "1" ]]; then
+            die "${EXIT_VALIDATION_ERROR}" "OPSKIT_RELEASE_PUBKEY override is forbidden in production unless OPSKIT_TEST_MODE=1 is set."
+        fi
+        echo "${OPSKIT_RELEASE_PUBKEY}"
+        return 0
+    fi
+    local mf_dir
+    mf_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "${LIB_DIR:-${mf_dir}}/release.pub" ]]; then
+        echo "${LIB_DIR:-${mf_dir}}/release.pub"
+    elif [[ -f "${mf_dir}/../keys/release.pub" ]]; then
+        echo "${mf_dir}/../keys/release.pub"
+    elif [[ -f "${BOOTSTRAP_STATE_DIR}/lib/release.pub" ]]; then
+        echo "${BOOTSTRAP_STATE_DIR}/lib/release.pub"
+    fi
+}
+
+get_expected_key_id() {
+    if [[ -n "${OPSKIT_EXPECTED_KEY_ID:-}" ]]; then
+        if [[ "${OPSKIT_TEST_MODE:-0}" != "1" ]]; then
+            die "${EXIT_VALIDATION_ERROR}" "OPSKIT_EXPECTED_KEY_ID override is forbidden in production unless OPSKIT_TEST_MODE=1 is set."
+        fi
+        echo "${OPSKIT_EXPECTED_KEY_ID}"
+        return 0
+    fi
+    echo "opskit-release-2026"
+}
+
+CLI_MUTATION_METADATA=""
+CLI_MUTATION_AFTER_FP=""
+CLI_MUTATION_BEFORE_FP=""
+
+canonicalize_manifest() {
+    local src="$1"
+    local dst="$2"
+    ensure_canonicalize_helper
+    python3 -B "${LIB_DIR}/canonicalize.py" --strip signatures "${src}" > "${dst}" || die "${EXIT_VALIDATION_ERROR}" "Failed to canonicalize manifest at '${src}'."
+}
+
+verify_and_install_cli() {
+    local manifest_source="${OPSKIT_MANIFEST_URL:-}"
+    local artifact_source_dir="${OPSKIT_ARTIFACT_SOURCE_DIR:-}"
+    local pubkey_path
+    pubkey_path="$(get_release_pubkey)"
+
+    # If artifact source dir flag or env provided
+    if [[ -n "${FLAG_ARTIFACT_DIR:-}" && -d "${FLAG_ARTIFACT_DIR}" ]]; then
+        artifact_source_dir="${FLAG_ARTIFACT_DIR}"
+    fi
+
+    # 1. Local artifact directory mode
+    if [[ -n "${artifact_source_dir}" && -d "${artifact_source_dir}" ]]; then
+        local manifest_path="${artifact_source_dir}/release-manifest.json"
+        verify_local_manifest_and_install "${manifest_path}" "${pubkey_path}" "${artifact_source_dir}"
+        return 0
+    fi
+
+    # 2. Remote network mode
+    if [[ -n "${manifest_source}" ]]; then
+        download_and_verify_manifest "${manifest_source}"
+        return 0
+    fi
+
+    # 3. Check for local artifacts beside script (derived from defined BIN_DIR/LIB_DIR)
+    local local_artifacts=""
+    if [[ -n "${BIN_DIR:-}" && -d "${BIN_DIR}/artifacts" && -f "${BIN_DIR}/artifacts/release-manifest.json" ]]; then
+        local_artifacts="${BIN_DIR}/artifacts"
+    elif [[ -n "${BIN_DIR:-}" && -d "${BIN_DIR}/../artifacts" && -f "${BIN_DIR}/../artifacts/release-manifest.json" ]]; then
+        local_artifacts="${BIN_DIR}/../artifacts"
+    elif [[ -n "${LIB_DIR:-}" && -d "${LIB_DIR}/../artifacts" && -f "${LIB_DIR}/../artifacts/release-manifest.json" ]]; then
+        local_artifacts="${LIB_DIR}/../artifacts"
+    fi
+    if [[ -n "${local_artifacts}" ]]; then
+        local manifest_path="${local_artifacts}/release-manifest.json"
+        verify_local_manifest_and_install "${manifest_path}" "${pubkey_path}" "${local_artifacts}"
+        return 0
+    fi
+
+    # 4. Neither provided: hard failure with remedy text (an existing on-disk binary is never an artifact source)
+    die "${EXIT_NETWORK_ERROR}" "No release manifest source provided. Provide --artifact-dir <path> (or set OPSKIT_ARTIFACT_SOURCE_DIR) for offline installation, or set OPSKIT_MANIFEST_URL to download release artifacts."
+}
+
+verify_local_manifest_preflight() {
+    local manifest_path="$1"
+    local pubkey_path="$2"
+    local host_arch="$3"
+
+    if [[ ! -f "${manifest_path}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest not found at '${manifest_path}'."
+    fi
+    if [[ ! -f "${pubkey_path}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Release public key not found at '${pubkey_path}'."
+    fi
+
+    # 1. Canonicalize manifest body
+    local canonical_manifest_tmp
+    canonical_manifest_tmp="$(mktemp)"
+    canonicalize_manifest "${manifest_path}" "${canonical_manifest_tmp}"
+
+    # 2. Extract Ed25519 signature
+    local sig_tmp
+    sig_tmp="$(mktemp)"
+    local sig_hex sig_key_id
+    sig_hex="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+for s in d.get('signatures', []):
+    if s.get('algorithm') == 'ed25519':
+        print(s.get('signature', ''))
+        break
+" "${manifest_path}" 2>/dev/null || true)"
+
+    sig_key_id="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+for s in d.get('signatures', []):
+    if s.get('algorithm') == 'ed25519':
+        print(s.get('key_id', ''))
+        break
+" "${manifest_path}" 2>/dev/null || true)"
+
+    if [[ -z "${sig_hex}" ]]; then
+        rm -f "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Manifest does not contain a supported Ed25519 signature."
+    fi
+    python3 -B -c "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))" "${sig_hex}" > "${sig_tmp}"
+
+    # Verify key_id strictly (both expected and manifest signature key_id must be present and equal)
+    local exp_key_id
+    exp_key_id="$(get_expected_key_id)"
+    local local_key_id_file="${pubkey_path%.pub}.key_id"
+    if [[ -z "${OPSKIT_EXPECTED_KEY_ID:-}" && -f "${local_key_id_file}" ]]; then
+        exp_key_id="$(tr -d ' \n\r' < "${local_key_id_file}")"
+    fi
+    if [[ -z "${exp_key_id}" ]]; then
+        rm -f "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Expected release key_id is not configured for manifest verification."
+    fi
+    if [[ -z "${sig_key_id}" ]]; then
+        rm -f "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest Ed25519 signature is missing required key_id."
+    fi
+    if [[ "${sig_key_id}" != "${exp_key_id}" ]]; then
+        rm -f "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest key_id mismatch (expected '${exp_key_id}', got '${sig_key_id}')."
+    fi
+
+    # Verify signature
+    local verify_ok=false
+    if openssl pkeyutl -verify -pubin -inkey "${pubkey_path}" -rawin -in "${canonical_manifest_tmp}" -sigfile "${sig_tmp}" >/dev/null 2>&1; then
+        verify_ok=true
+    fi
+    rm -f "${canonical_manifest_tmp}" "${sig_tmp}"
+    if ! ${verify_ok}; then
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest signature verification failed for '${manifest_path}'."
+    fi
+
+    # 3. Check architecture presence and verify local artifact payload matches digest and size
+    local artifact_key="opskit-linux-${host_arch}"
+    local preflight_info
+    preflight_info="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+arts = d.get('artifacts', {})
+k = sys.argv[2]
+if k not in arts or not isinstance(arts[k], dict):
+    print('missing')
+    sys.exit(0)
+art = arts[k]
+sha = str(art.get('sha256', '') or '')
+sz = art.get('size', '')
+fn = str(art.get('filename', k) or k)
+print(f'ok|{sha}|{sz}|{fn}')
+" "${manifest_path}" "${artifact_key}" 2>/dev/null || echo "missing")"
+
+    if [[ "${preflight_info}" == "missing" || "${preflight_info}" != ok\|* ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest does not declare artifact for host architecture '${host_arch}'."
+    fi
+
+    local exp_sha exp_size exp_filename
+    IFS='|' read -r _ exp_sha exp_size exp_filename <<< "${preflight_info}"
+    if [[ -z "${exp_sha}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest artifact '${artifact_key}' is missing sha256 digest."
+    fi
+    if [[ ! "${exp_size}" =~ ^[0-9]+$ || "${exp_size}" -le 0 ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest artifact '${artifact_key}' declares invalid or non-positive size '${exp_size}'."
+    fi
+
+    local base_dir artifact_path actual_sha actual_size
+    base_dir="$(dirname "${manifest_path}")"
+    artifact_path="${base_dir}/${exp_filename}"
+    if [[ ! -f "${artifact_path}" ]]; then
+        artifact_path="${base_dir}/${artifact_key}"
+    fi
+    if [[ ! -f "${artifact_path}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Artifact '${exp_filename}' not found in source directory '${base_dir}'."
+    fi
+    actual_sha="$(compute_sha256 "${artifact_path}")"
+    if [[ "${actual_sha}" != "${exp_sha}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Artifact '${exp_filename}' digest mismatch (expected ${exp_sha}, got ${actual_sha}). Tampered binary rejected."
+    fi
+    actual_size="$(wc -c < "${artifact_path}" | tr -d '[:space:]')"
+    if [[ "${actual_size}" -ne "${exp_size}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Artifact '${exp_filename}' size mismatch (expected ${exp_size}, got ${actual_size})."
+    fi
+}
+
+_cli_originated_from_opskit() {
+    local ledger="${LEDGER_FILE:-${BOOTSTRAP_STATE_DIR}/apply.jsonl}"
+    if [[ -f "${ledger}" && ! -f "${CLI_INSTALL_PATH}.pre-bootstrap" ]]; then
+        if python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r') as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get('mutation_id') == 'fetch_cli':
+            md = d.get('metadata', {})
+            if d.get('before_fingerprint') == 'absent' and not (isinstance(md, dict) and md.get('pre_existing', False)):
+                sys.exit(0)
+sys.exit(1)
+" "${ledger}" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Resolve pre-existing / backup state before installing a verified CLI binary.
+# Sets _CLI_PRE_EXISTING, _CLI_BACKUP_PATH, _CLI_PREVIOUS_SHA, _CLI_BEFORE_FP.
+# Returns 0 if installation should proceed, or 1 if destination already matches expected_sha.
+_prepare_cli_install_state() {
+    local expected_sha="$1"
+    _CLI_PRE_EXISTING=false
+    _CLI_BACKUP_PATH=""
+    _CLI_PREVIOUS_SHA=""
+    _CLI_BEFORE_FP="absent"
+
+    if [[ -f "${CLI_INSTALL_PATH}.pre-bootstrap" ]]; then
+        _CLI_PRE_EXISTING=true
+        _CLI_BACKUP_PATH="${CLI_INSTALL_PATH}.pre-bootstrap"
+        _CLI_PREVIOUS_SHA="$(compute_sha256 "${_CLI_BACKUP_PATH}")"
+        _CLI_BEFORE_FP="present:${_CLI_PREVIOUS_SHA}"
+    fi
+
+    if [[ -f "${CLI_INSTALL_PATH}" ]]; then
+        local current_sha
+        current_sha="$(compute_sha256 "${CLI_INSTALL_PATH}")"
+        if [[ "${current_sha}" == "${expected_sha}" ]]; then
+            log_info "CLI binary at ${CLI_INSTALL_PATH} already matches verified release digest (${expected_sha})."
+            local backup_existing=false
+            if [[ -f "${CLI_INSTALL_PATH}.pre-bootstrap" ]]; then
+                backup_existing=true
+                _CLI_BACKUP_PATH="${CLI_INSTALL_PATH}.pre-bootstrap"
+                _CLI_BEFORE_FP="present:$(compute_sha256 "${_CLI_BACKUP_PATH}")"
+            elif _cli_originated_from_opskit; then
+                backup_existing=false
+                _CLI_BACKUP_PATH=""
+                _CLI_BEFORE_FP="absent"
+            else
+                _CLI_BEFORE_FP="present:${current_sha}"
+            fi
+            CLI_MUTATION_METADATA="{\"path\":\"$(json_escape "${CLI_INSTALL_PATH}")\",\"installed_sha256\":\"$(json_escape "${expected_sha}")\",\"pre_existing\":${backup_existing},\"backup_path\":\"$(json_escape "${_CLI_BACKUP_PATH}")\",\"previous_sha256\":\"$(json_escape "${current_sha}")\"}"
+            CLI_MUTATION_AFTER_FP="present:digest-verified"
+            CLI_MUTATION_BEFORE_FP="${_CLI_BEFORE_FP}"
+            return 1
+        fi
+        if _cli_originated_from_opskit; then
+            _CLI_PRE_EXISTING=false
+            _CLI_BACKUP_PATH=""
+            _CLI_PREVIOUS_SHA="${current_sha}"
+            _CLI_BEFORE_FP="absent"
+        else
+            _CLI_PRE_EXISTING=true
+            _CLI_BACKUP_PATH="${CLI_INSTALL_PATH}.pre-bootstrap"
+            if [[ ! -f "${_CLI_BACKUP_PATH}" ]]; then
+                cp -a "${CLI_INSTALL_PATH}" "${_CLI_BACKUP_PATH}"
+                log_info "Backed up pre-existing CLI binary to ${_CLI_BACKUP_PATH}."
+                _CLI_PREVIOUS_SHA="${current_sha}"
+            else
+                log_info "Preserved original pre-bootstrap backup at ${_CLI_BACKUP_PATH}."
+                _CLI_PREVIOUS_SHA="$(compute_sha256 "${_CLI_BACKUP_PATH}")"
+            fi
+            _CLI_BEFORE_FP="present:${_CLI_PREVIOUS_SHA}"
+        fi
+    fi
+    return 0
+}
+
+verify_local_manifest_and_install() {
+    local manifest_path="$1"
+    local pubkey_path="$2"
+    local base_dir="$3"
+
+    if [[ ! -f "${manifest_path}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest not found at '${manifest_path}'."
+    fi
+    if [[ ! -f "${pubkey_path}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Release public key not found at '${pubkey_path}'."
+    fi
+
+    log_info "Verifying release manifest '${manifest_path}'..."
+
+    # 1. Canonicalize manifest body
+    local canonical_manifest_tmp
+    canonical_manifest_tmp="$(mktemp)"
+    canonicalize_manifest "${manifest_path}" "${canonical_manifest_tmp}"
+
+    # 2. Extract and verify Ed25519 signature and key_id
+    local sig_tmp
+    sig_tmp="$(mktemp)"
+    local sig_hex sig_key_id
+    sig_hex="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+for s in d.get('signatures', []):
+    if s.get('algorithm') == 'ed25519':
+        print(s.get('signature', ''))
+        break
+" "${manifest_path}" 2>/dev/null || true)"
+
+    sig_key_id="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+for s in d.get('signatures', []):
+    if s.get('algorithm') == 'ed25519':
+        print(s.get('key_id', ''))
+        break
+" "${manifest_path}" 2>/dev/null || true)"
+
+    if [[ -z "${sig_hex}" ]]; then
+        if [[ -f "${manifest_path}.sig" ]]; then
+            cp "${manifest_path}.sig" "${sig_tmp}"
+        else
+            rm -f "${canonical_manifest_tmp}" "${sig_tmp}"
+            die "${EXIT_VALIDATION_ERROR}" "Manifest does not contain a supported Ed25519 signature."
+        fi
+    else
+        python3 -B -c "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))" "${sig_hex}" > "${sig_tmp}"
+    fi
+
+    # Verify key_id against pinned key identifier (reject empty/missing key_id)
+    local exp_key_id
+    exp_key_id="$(get_expected_key_id)"
+    local local_key_id_file="${pubkey_path%.pub}.key_id"
+    if [[ -z "${OPSKIT_EXPECTED_KEY_ID:-}" && -f "${local_key_id_file}" ]]; then
+        exp_key_id="$(tr -d ' \n\r' < "${local_key_id_file}")"
+    fi
+    if [[ -z "${exp_key_id}" ]]; then
+        rm -f "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Expected release key_id is not configured for manifest verification."
+    fi
+    if [[ -z "${sig_key_id}" ]]; then
+        rm -f "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest Ed25519 signature is missing required key_id."
+    fi
+    if [[ "${sig_key_id}" != "${exp_key_id}" ]]; then
+        rm -f "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest key_id mismatch (expected '${exp_key_id}', got '${sig_key_id}'). Untrusted manifest."
+    fi
+
+    # 3. Verify signature via openssl pkeyutl (Ed25519 rawin)
+    local verify_ok=false
+    if openssl pkeyutl -verify -pubin -inkey "${pubkey_path}" -rawin -in "${canonical_manifest_tmp}" -sigfile "${sig_tmp}" >/dev/null 2>&1; then
+        verify_ok=true
+    fi
+
+    rm -f "${canonical_manifest_tmp}" "${sig_tmp}"
+
+    if ! ${verify_ok}; then
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest signature verification failed. Untrusted manifest."
+    fi
+    log_info "Release manifest signature verified successfully."
+
+    # 4. Resolve arch-specific artifact
+    local host_arch
+    host_arch="$(uname -m)"
+    local artifact_key="opskit-linux-${host_arch}"
+
+    local expected_sha expected_size expected_filename
+    expected_sha="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+art = d.get('artifacts', {}).get(sys.argv[2], {})
+print(art.get('sha256', ''))
+" "${manifest_path}" "${artifact_key}" 2>/dev/null || true)"
+
+    expected_size="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+art = d.get('artifacts', {}).get(sys.argv[2], {})
+print(art.get('size', 0))
+" "${manifest_path}" "${artifact_key}" 2>/dev/null || echo 0)"
+
+    expected_filename="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+art = d.get('artifacts', {}).get(sys.argv[2], {})
+print(art.get('filename', sys.argv[2]))
+" "${manifest_path}" "${artifact_key}" 2>/dev/null || echo "${artifact_key}")"
+
+    if [[ -z "${expected_sha}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "No artifact found in release manifest for architecture '${host_arch}'."
+    fi
+
+    local artifact_path="${base_dir}/${expected_filename}"
+    if [[ ! -f "${artifact_path}" ]]; then
+        artifact_path="${base_dir}/${artifact_key}"
+    fi
+
+    if [[ ! -f "${artifact_path}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Artifact '${expected_filename}' not found in source directory."
+    fi
+
+    # 5. Verify digest and size
+    local actual_sha
+    actual_sha="$(compute_sha256 "${artifact_path}")"
+    if [[ "${actual_sha}" != "${expected_sha}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Artifact '${expected_filename}' digest mismatch (expected ${expected_sha}, got ${actual_sha}). Tampered binary rejected."
+    fi
+
+    if [[ ! "${expected_size}" =~ ^[0-9]+$ || "${expected_size}" -le 0 ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Artifact '${expected_filename}' declares invalid or non-positive size '${expected_size}'."
+    fi
+    local actual_size
+    actual_size="$(wc -c < "${artifact_path}" | tr -d '[:space:]')"
+    if [[ "${actual_size}" -ne "${expected_size}" ]]; then
+        die "${EXIT_VALIDATION_ERROR}" "Artifact '${expected_filename}' size mismatch (expected ${expected_size}, got ${actual_size})."
+    fi
+
+    # 6. Check pre-existing CLI binary
+    if ! _prepare_cli_install_state "${expected_sha}"; then
+        return 0
+    fi
+    CLI_MUTATION_BEFORE_FP="${_CLI_BEFORE_FP}"
+
+    log_info "Artifact digest verified (${actual_sha}). Installing to ${CLI_INSTALL_PATH}..."
+    local tmp_install
+    tmp_install="$(mktemp "${CLI_INSTALL_PATH}.tmp.XXXXXX")"
+    cp "${artifact_path}" "${tmp_install}"
+    chmod 0755 "${tmp_install}"
+    if [[ "${EUID}" -eq 0 ]]; then
+        chown root:root "${tmp_install}"
+    fi
+    mv "${tmp_install}" "${CLI_INSTALL_PATH}"
+
+    CLI_MUTATION_METADATA="{\"path\":\"$(json_escape "${CLI_INSTALL_PATH}")\",\"installed_sha256\":\"$(json_escape "${actual_sha}")\",\"pre_existing\":${_CLI_PRE_EXISTING},\"backup_path\":\"$(json_escape "${_CLI_BACKUP_PATH}")\",\"previous_sha256\":\"$(json_escape "${_CLI_PREVIOUS_SHA}")\"}"
+    CLI_MUTATION_AFTER_FP="installed:${CLI_INSTALL_PATH}"
+    log_info "Installed static CLI to ${CLI_INSTALL_PATH} (mode 0755)."
+}
+
+download_and_verify_manifest() {
+    local url="$1"
+    log_info "Fetching release manifest from ${url}..."
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    local curl_flags=(-s -S --fail --max-time 30)
+    [[ -n "${FLAG_PROXY:-}" ]] && curl_flags+=(--proxy "${FLAG_PROXY}")
+    [[ -n "${FLAG_CACERT:-}" ]] && curl_flags+=(--cacert "${FLAG_CACERT}")
+
+    curl "${curl_flags[@]}" -o "${tmp_dir}/release-manifest.json" "${url}" || {
+        rm -rf "${tmp_dir}"
+        die "${EXIT_NETWORK_ERROR}" "Failed to download release manifest from ${url}. Check network connectivity, proxy settings, or custom CA bundle."
+    }
+
+    local pubkey_file
+    pubkey_file="$(get_release_pubkey)"
+    if [[ -z "${pubkey_file}" || ! -f "${pubkey_file}" ]]; then
+        rm -rf "${tmp_dir}"
+        die "${EXIT_VALIDATION_ERROR}" "No trusted release public key available for manifest verification."
+    fi
+
+    # 1. Canonicalize and verify manifest signature
+    local canonical_manifest_tmp
+    canonical_manifest_tmp="$(mktemp)"
+    canonicalize_manifest "${tmp_dir}/release-manifest.json" "${canonical_manifest_tmp}"
+
+    local sig_tmp
+    sig_tmp="$(mktemp)"
+    local sig_hex sig_key_id
+    sig_hex="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+for s in d.get('signatures', []):
+    if s.get('algorithm') == 'ed25519':
+        print(s.get('signature', ''))
+        break
+" "${tmp_dir}/release-manifest.json" 2>/dev/null || true)"
+
+    sig_key_id="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+for s in d.get('signatures', []):
+    if s.get('algorithm') == 'ed25519':
+        print(s.get('key_id', ''))
+        break
+" "${tmp_dir}/release-manifest.json" 2>/dev/null || true)"
+
+    if [[ -z "${sig_hex}" ]]; then
+        rm -rf "${tmp_dir}" "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Remote release manifest does not contain a supported Ed25519 signature."
+    fi
+    python3 -B -c "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))" "${sig_hex}" > "${sig_tmp}"
+
+    local exp_key_id
+    exp_key_id="$(get_expected_key_id)"
+    local local_key_id_file="${pubkey_file%.pub}.key_id"
+    if [[ -z "${OPSKIT_EXPECTED_KEY_ID:-}" && -f "${local_key_id_file}" ]]; then
+        exp_key_id="$(tr -d ' \n\r' < "${local_key_id_file}")"
+    fi
+
+    if [[ -z "${exp_key_id}" ]]; then
+        rm -rf "${tmp_dir}" "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Expected release key_id is not configured for manifest verification."
+    fi
+    if [[ -z "${sig_key_id}" ]]; then
+        rm -rf "${tmp_dir}" "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest Ed25519 signature is missing required key_id."
+    fi
+    if [[ "${sig_key_id}" != "${exp_key_id}" ]]; then
+        rm -rf "${tmp_dir}" "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest key_id mismatch (expected '${exp_key_id}', got '${sig_key_id}'). Untrusted manifest."
+    fi
+
+    if ! openssl pkeyutl -verify -pubin -inkey "${pubkey_file}" -rawin -in "${canonical_manifest_tmp}" -sigfile "${sig_tmp}" >/dev/null 2>&1; then
+        rm -rf "${tmp_dir}" "${canonical_manifest_tmp}" "${sig_tmp}"
+        die "${EXIT_VALIDATION_ERROR}" "Remote release manifest signature verification failed. Untrusted manifest."
+    fi
+    rm -f "${canonical_manifest_tmp}" "${sig_tmp}"
+    log_info "Remote release manifest signature verified successfully."
+
+    # 2. Resolve artifact for host arch
+    local host_arch
+    host_arch="$(uname -m)"
+    local artifact_key="opskit-linux-${host_arch}"
+
+    local expected_sha expected_size expected_filename
+    expected_sha="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+art = d.get('artifacts', {}).get(sys.argv[2], {})
+print(art.get('sha256', ''))
+" "${tmp_dir}/release-manifest.json" "${artifact_key}" 2>/dev/null || true)"
+
+    expected_size="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+art = d.get('artifacts', {}).get(sys.argv[2], {})
+print(art.get('size', 0))
+" "${tmp_dir}/release-manifest.json" "${artifact_key}" 2>/dev/null || echo 0)"
+
+    expected_filename="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+art = d.get('artifacts', {}).get(sys.argv[2], {})
+print(art.get('filename', sys.argv[2]))
+" "${tmp_dir}/release-manifest.json" "${artifact_key}" 2>/dev/null || echo "${artifact_key}")"
+
+    if [[ -z "${expected_sha}" ]]; then
+        rm -rf "${tmp_dir}"
+        die "${EXIT_VALIDATION_ERROR}" "No artifact found in release manifest for architecture '${host_arch}'."
+    fi
+
+    # 3. Download artifact payload
+    local base_url
+    base_url="$(dirname "${url}")"
+    local artifact_url="${base_url}/${expected_filename}"
+    log_info "Downloading release payload from ${artifact_url}..."
+    curl "${curl_flags[@]}" -o "${tmp_dir}/${expected_filename}" "${artifact_url}" || {
+        rm -rf "${tmp_dir}"
+        die "${EXIT_NETWORK_ERROR}" "Failed to download release payload from ${artifact_url}. Check network connectivity, proxy settings, or custom CA bundle."
+    }
+
+    # 4. Verify artifact digest and size
+    local actual_sha
+    actual_sha="$(compute_sha256 "${tmp_dir}/${expected_filename}")"
+    if [[ "${actual_sha}" != "${expected_sha}" ]]; then
+        rm -rf "${tmp_dir}"
+        die "${EXIT_VALIDATION_ERROR}" "Downloaded payload '${expected_filename}' digest mismatch (expected ${expected_sha}, got ${actual_sha}). Tampered binary rejected."
+    fi
+
+    if [[ ! "${expected_size}" =~ ^[0-9]+$ || "${expected_size}" -le 0 ]]; then
+        rm -rf "${tmp_dir}"
+        die "${EXIT_VALIDATION_ERROR}" "Downloaded payload '${expected_filename}' declares invalid or non-positive size '${expected_size}'."
+    fi
+    local actual_size
+    actual_size="$(wc -c < "${tmp_dir}/${expected_filename}" | tr -d '[:space:]')"
+    if [[ "${actual_size}" -ne "${expected_size}" ]]; then
+        rm -rf "${tmp_dir}"
+        die "${EXIT_VALIDATION_ERROR}" "Downloaded payload '${expected_filename}' size mismatch (expected ${expected_size}, got ${actual_size})."
+    fi
+
+    # 5. Handle pre-existing CLI binary
+    if ! _prepare_cli_install_state "${expected_sha}"; then
+        rm -rf "${tmp_dir}"
+        return 0
+    fi
+    CLI_MUTATION_BEFORE_FP="${_CLI_BEFORE_FP}"
+
+    log_info "Payload verified (${actual_sha}). Installing to ${CLI_INSTALL_PATH}..."
+    local tmp_install
+    tmp_install="$(mktemp "${CLI_INSTALL_PATH}.tmp.XXXXXX")"
+    cp "${tmp_dir}/${expected_filename}" "${tmp_install}"
+    chmod 0755 "${tmp_install}"
+    if [[ "${EUID}" -eq 0 ]]; then
+        chown root:root "${tmp_install}"
+    fi
+    mv "${tmp_install}" "${CLI_INSTALL_PATH}"
+    rm -rf "${tmp_dir}"
+
+    CLI_MUTATION_METADATA="{\"path\":\"$(json_escape "${CLI_INSTALL_PATH}")\",\"installed_sha256\":\"$(json_escape "${actual_sha}")\",\"pre_existing\":${_CLI_PRE_EXISTING},\"backup_path\":\"$(json_escape "${_CLI_BACKUP_PATH}")\",\"previous_sha256\":\"$(json_escape "${_CLI_PREVIOUS_SHA}")\"}"
+    CLI_MUTATION_AFTER_FP="installed:${CLI_INSTALL_PATH}"
+    log_info "Installed static CLI to ${CLI_INSTALL_PATH} (mode 0755)."
+}

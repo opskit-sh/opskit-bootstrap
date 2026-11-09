@@ -1,0 +1,18 @@
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    systemd \
+    systemd-sysv \
+    procps \
+    iproute2 \
+    curl \
+    ca-certificates \
+    openssl \
+    python3 \
+    podman \
+    uidmap \
+    busybox-static \
+    iptables \
+    nftables \
+    ufw \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+CMD ["/sbin/init"]
