@@ -118,6 +118,87 @@ test -f /usr/local/bin/opskit
 test -f /var/lib/opskit-bootstrap/apply.jsonl
 echo "SLES private verified."
 '
+
+    echo "--- Test 1D: Ubuntu 24.04 (direct profile smoke run: bootstrap + re-run no-op + undo + zero-trace) ---"
+    if ! podman image exists localhost/opskit-test-ubuntu:24.04 2>/dev/null; then
+        echo "Building localhost/opskit-test-ubuntu:24.04 image..."
+        podman build -t localhost/opskit-test-ubuntu:24.04 -f "${REPO_ROOT}/tests/fixtures/containers/Containerfile.ubuntu" "${REPO_ROOT}" >/dev/null
+    fi
+    podman run --rm --privileged -v "${REPO_ROOT}:/bootstrap:ro" -v "${TEST_ARTIFACTS_DIR}:/artifacts:ro" localhost/opskit-test-ubuntu:24.04 /bin/bash -c '
+set -euo pipefail
+export OPSKIT_TEST_MODE="1"
+export MOCK_KERNEL_RELEASE="6.8.0-31-generic"
+export MOCK_DISK_FREE_GB="50"
+export OPSKIT_SKIP_DISK_CHECK="1"
+export OPSKIT_ARTIFACT_SOURCE_DIR="/artifacts"
+export OPSKIT_RELEASE_PUBKEY="/artifacts/release.pub"
+export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
+
+# 1. Bootstrap direct
+/bootstrap/bin/opskit-bootstrap --profile direct --no-probe --yes >/dev/null
+id opskit >/dev/null
+test -f /etc/systemd/system/opskit-edge-443.socket
+test -f /etc/systemd/system/opskit-edge.service
+test -f /usr/local/bin/opskit
+test -f /var/lib/opskit-bootstrap/apply.jsonl
+lines_first="$(wc -l < /var/lib/opskit-bootstrap/apply.jsonl)"
+
+# 2. Re-run is a true no-op
+out="$(/bootstrap/bin/opskit-bootstrap --profile direct --no-probe --yes 2>&1)"
+lines_second="$(wc -l < /var/lib/opskit-bootstrap/apply.jsonl)"
+test "${lines_first}" -eq "${lines_second}"
+if [[ "${out}" != *"Host already bootstrapped; no changes required"* ]]; then
+    echo "FAIL: unexpected output on re-run: ${out}" >&2
+    exit 1
+fi
+
+# 3. Undo purge
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
+
+# 4. Zero-trace verification
+! id opskit >/dev/null 2>&1
+test ! -e /home/opskit
+test ! -e /var/lib/opskit-bootstrap
+test ! -e /usr/local/bin/opskit
+test ! -e /etc/systemd/system/opskit-edge-443.socket
+test ! -e /etc/systemd/system/opskit-edge-80.socket
+test ! -e /etc/systemd/system/opskit-edge.service
+test ! -e /var/lib/systemd/linger/opskit
+test "$(grep -c "^opskit:" /etc/subuid 2>/dev/null || true)" -eq 0
+test "$(grep -c "^opskit:" /etc/subgid 2>/dev/null || true)" -eq 0
+echo "Ubuntu 24.04 direct smoke run verified."
+'
+
+    echo "--- Test 1E: Ubuntu 22.04 negative gate refusal ---"
+    local mock_os_rel
+    mock_os_rel="$(mktemp)"
+    cat << 'EOF' > "${mock_os_rel}"
+NAME="Ubuntu"
+VERSION_ID="22.04"
+ID=ubuntu
+ID_LIKE=debian
+VERSION="22.04.4 LTS (Jammy Jellyfish)"
+EOF
+
+    set +e
+    local gate_out
+    gate_out="$(OPSKIT_TEST_MODE="1" OPSKIT_OS_RELEASE_FILE="${mock_os_rel}" "${REPO_ROOT}/bin/opskit-bootstrap" --dry-run 2>&1)"
+    local gate_rc=$?
+    set -e
+    rm -f "${mock_os_rel}"
+
+    if [[ "${gate_rc}" -ne 8 ]]; then
+        echo "FAIL: Ubuntu 22.04 gate check expected exit 8, got ${gate_rc}" >&2
+        echo "Output: ${gate_out}" >&2
+        exit 1
+    fi
+
+    if [[ "${gate_out}" != *"Ubuntu 24.04 LTS (noble) or higher required; found Ubuntu 22.04. Upgrade using 'do-release-upgrade'."* ]]; then
+        echo "FAIL: Ubuntu 22.04 gate output did not contain expected remedy text" >&2
+        echo "Output: ${gate_out}" >&2
+        exit 1
+    fi
+    echo "Ubuntu 22.04 negative gate refusal verified."
 }
 
 # Test 2: Pre-existing service user with existing subuid allocation

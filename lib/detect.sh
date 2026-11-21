@@ -42,6 +42,13 @@ detect_capabilities() {
                 die "${EXIT_VALIDATION_ERROR}" "Debian 13 (trixie) or higher required; found Debian ${OS_VERSION_ID:-unknown}. Upgrade to Debian 13 using 'apt-get dist-upgrade'."
             fi
             ;;
+        ubuntu)
+            DETECTED_FAMILY="debian"
+            local major_version="${OS_VERSION_ID%%.*}"
+            if [[ -z "${major_version}" ]] || ! [[ "${major_version}" =~ ^[0-9]+$ ]] || [[ "${major_version}" -lt 24 ]]; then
+                die "${EXIT_VALIDATION_ERROR}" "Ubuntu 24.04 LTS (noble) or higher required; found Ubuntu ${OS_VERSION_ID:-unknown}. Upgrade using 'do-release-upgrade'."
+            fi
+            ;;
         rhel|centos|rocky|almalinux)
             DETECTED_FAMILY="rhel"
             local major_version="${OS_VERSION_ID%%.*}"
@@ -81,10 +88,10 @@ detect_capabilities() {
                 DETECTED_FAMILY="rhel"
             elif [[ "${ID_LIKE}" =~ (suse|opensuse) ]]; then
                 DETECTED_FAMILY="sles"
-            elif [[ "${ID_LIKE}" =~ (debian) ]]; then
+            elif [[ "${ID_LIKE}" =~ (debian|ubuntu) ]]; then
                 DETECTED_FAMILY="debian"
             else
-                die "${EXIT_VALIDATION_ERROR}" "Unsupported distribution '${OS_ID}'. Supported distributions are Debian 13+, RHEL 9+, Fedora Server 39+, and SLES 15 SP7+."
+                die "${EXIT_VALIDATION_ERROR}" "Unsupported distribution '${OS_ID}'. Supported distributions are Debian 13+, Ubuntu 24.04+, RHEL 9+, Fedora Server 39+, and SLES 15 SP7+."
             fi
             ;;
     esac
@@ -102,6 +109,7 @@ detect_capabilities() {
     fi
 
     # Linux kernel gate: >= 5.4
+    # Upstream isolation floor (user namespaces + cgroups v2): https://man7.org/linux/man-pages/man7/user_namespaces.7.html
     KERNEL_RELEASE="${MOCK_KERNEL_RELEASE:-$(uname -r)}"
     local k_major k_minor
     k_major="$(echo "${KERNEL_RELEASE}" | cut -d. -f1)"
@@ -111,6 +119,7 @@ detect_capabilities() {
     fi
 
     # cgroups v2 check
+    # Upstream cgroups v2 hierarchy and resource controllers: https://docs.kernel.org/admin-guide/cgroup-v2.html
     CGROUPS_V2=false
     CGROUP_CONTROLLERS=()
     if [[ -n "${MOCK_CGROUP_CONTROLLERS:-}" ]]; then
@@ -149,6 +158,7 @@ detect_capabilities() {
     fi
 
     # systemd user manager verification
+    # Upstream systemd per-user service manager execution environment: https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
     SYSTEMD_USER_MANAGER=false
     if ${SYSTEMD_RUNNING}; then
         if [[ -d /usr/lib/systemd/user || -d /etc/systemd/user || -d /run/systemd/user ]]; then
@@ -179,6 +189,7 @@ detect_capabilities() {
             DETECTED_RUNTIME="podman"
             RUNTIME_VERSION="$(podman --version 2>/dev/null | awk '{print $3}')"
             # Version gate: Podman >= 4.4 required for systemd Quadlet support
+            # Upstream Quadlet generator specification (merged Podman 4.4): https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html
             local p_major p_minor
             p_major="$(echo "${RUNTIME_VERSION}" | cut -d. -f1)"
             p_minor="$(echo "${RUNTIME_VERSION}" | cut -d. -f2)"
@@ -197,6 +208,7 @@ detect_capabilities() {
     fi
 
     # User namespace tools
+    # Upstream user namespace subordinate mapping toolchain: https://man7.org/linux/man-pages/man7/user_namespaces.7.html
     NEWUIDMAP_PRESENT=false
     NEWGIDMAP_PRESENT=false
     UIDMAP_PACKAGE_NEEDED=false
@@ -211,6 +223,7 @@ detect_capabilities() {
     fi
 
     # Subuid and Subgid files (audit both before marking allocation complete)
+    # Upstream subordinate user and group ID range specifications: https://man7.org/linux/man-pages/man5/subuid.5.html and https://man7.org/linux/man-pages/man5/subgid.5.html
     SUBUID_FILE="${OPSKIT_SUBUID_FILE:-/etc/subuid}"
     SUBGID_FILE="${OPSKIT_SUBGID_FILE:-/etc/subgid}"
     SUBUID_ALLOCATED=false

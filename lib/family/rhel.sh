@@ -41,6 +41,7 @@ family_create_service_user() {
     fi
     if ! id "${user}" >/dev/null 2>&1; then
         local created=false
+        # Upstream system user drop-in configuration format: https://www.freedesktop.org/software/systemd/man/latest/sysusers.d.html
         if command -v systemd-sysusers >/dev/null 2>&1; then
             mkdir -p /etc/sysusers.d
             echo "u ${user} - \"OpsKit Service Account\" /home/${user} ${nologin_shell}" > "/etc/sysusers.d/${user}.conf"

@@ -9,11 +9,13 @@ gates, reachability verification, and the machine plan format.
 Before any mutation is proposed or applied, `opskit-bootstrap` performs a
 read-only audit of host capabilities. All checks must pass; failing gates
 exit with code `8` (`VALIDATION_ERROR`) and provide distribution-specific
-remediation steps.
+remediation steps. Ubuntu runs through the debian family modules (apt),
+capability-identical (cgroup v2 default since 22.04, Podman Quadlet since 24.04).
+openSUSE Tumbleweed is accepted ungated (rolling release).
 
 | Capability | Requirement | Detection Method | Failure Remedy |
 |---|---|---|---|
-| Operating System | Debian 13+, RHEL 9+, Fedora 39+, SLES 15 SP7+, openSUSE Leap 15.6+ | `/etc/os-release` parsing | Hard gate failure with distro-specific upgrade guidance |
+| Operating System | Debian 13+, Ubuntu 24.04+ (incl. 25.x interim), RHEL 9+, Fedora 39+, SLES 15 SP7+, openSUSE Leap 15.6+ / Tumbleweed | `/etc/os-release` parsing | Hard gate failure with distro-specific upgrade guidance |
 | Python 3 Runtime | Python 3 interpreter available | PATH executable lookup | Hard gate: install `python3` via package manager (`apt-get install -y python3`, `dnf install -y python3`, or `zypper install -y python3`) |
 | Linux Kernel | Kernel version >= 5.4 | `uname -r` | Hard gate: upgrade host kernel to enable rootless container namespaces |
 | cgroups v2 | cgroups v2 hierarchy mounted (available controllers recorded in machine plan) | `/sys/fs/cgroup/cgroup.controllers` or `cgroup2` in `/proc/mounts` | Hard gate: mount cgroups v2 hierarchy |

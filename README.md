@@ -14,9 +14,9 @@ rewritten under root control).
 
 | OS Family | Supported Distributions | Package Toolchain |
 |---|---|---|
-| Debian | Debian 13 (trixie) or higher | `apt-get` |
+| Debian | Debian 13 (trixie) or higher, Ubuntu 24.04+ (incl. 25.x interim) | `apt-get` |
 | Enterprise Linux | RHEL 9/10, AlmaLinux 9/10, Rocky Linux 9/10, Fedora Server 39+ | `dnf` |
-| SUSE | SLES 15 SP7+, openSUSE Leap 15.6+ | `zypper` |
+| SUSE | SLES 15 SP7+, openSUSE Leap 15.6+, openSUSE Tumbleweed | `zypper` |
 
 ## Architecture and Seam
 

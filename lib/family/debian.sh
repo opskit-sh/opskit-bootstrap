@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Debian family package and system configuration adapter (Debian 13+).
+# Debian family package and system configuration adapter (Debian 13+, Ubuntu 24.04+).
 set -euo pipefail
 
 family_install_packages() {
@@ -43,6 +43,7 @@ family_create_service_user() {
     fi
     if ! id "${user}" >/dev/null 2>&1; then
         local created=false
+        # Upstream system user drop-in configuration format: https://www.freedesktop.org/software/systemd/man/latest/sysusers.d.html
         if command -v systemd-sysusers >/dev/null 2>&1; then
             mkdir -p /etc/sysusers.d
             echo "u ${user} - \"OpsKit Service Account\" /home/${user} ${nologin_shell}" > "/etc/sysusers.d/${user}.conf"
