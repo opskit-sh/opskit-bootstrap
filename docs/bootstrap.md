@@ -20,7 +20,8 @@ openSUSE Tumbleweed is accepted ungated (rolling release).
 | Linux Kernel | Kernel version >= 5.4 | `uname -r` | Hard gate: upgrade host kernel to enable rootless container namespaces |
 | cgroups v2 | cgroups v2 hierarchy mounted (available controllers recorded in machine plan) | `/sys/fs/cgroup/cgroup.controllers` or `cgroup2` in `/proc/mounts` | Hard gate: mount cgroups v2 hierarchy |
 | Service Manager | systemd detection (`systemd_running` and user manager recorded) | `/run/systemd/system` or PID 1 process name check | Recorded for unit enablement and reload behavior |
-| Container Runtime | Podman >= 4.4 (for Quadlet support) or rootless Docker | `podman --version` / `docker --version` | Hard gate if present version is < 4.4. Package install planned if absent |
+| Container Runtime | Podman >= 4.4 (for Quadlet support) or rootless Docker | `podman --version` / `docker --version` + rootless socket probe | Hard gate if Podman < 4.4. Pre-installed rootful Docker is converted to rootless via `dockerd-rootless-setuptool.sh` or fails closed; Podman installed if absent |
+| cgroup Delegation | `Delegate=yes` on systemd `user@.service` | `/etc/systemd/system/user@.service.d/` + `DelegateControllers` | Drop-in `opskit-delegate.conf` configured so memory, cpu, and pids limits are enforced |
 | User Namespaces | `newuidmap` and `newgidmap` available | PATH executable lookup | Package install planned: `uidmap` (Debian), `shadow-utils` (RHEL), or `shadow` (SLES) |
 | Subordinate IDs | `/etc/subuid` and `/etc/subgid` available | File existence and permissions | Ensure shadow utility files are present and writable |
 | Security Modules | SELinux and AppArmor recorded | `getenforce` / `aa-status` | Recorded for context; security modules are never disabled |

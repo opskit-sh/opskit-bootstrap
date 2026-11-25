@@ -131,6 +131,16 @@ WantedBy=default.target
 EOF
 }
 
+expected_cgroup_delegate_conf() {
+    # Upstream systemd cgroup v2 user delegation drop-in:
+    # https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html
+    cat << 'EOF'
+# Configured by opskit-bootstrap for rootless container cgroup v2 resource limits
+[Service]
+Delegate=yes
+EOF
+}
+
 compile_plan() {
     # Validate existing ledger before planning
     if [[ -f "${LEDGER_FILE}" ]]; then
@@ -156,7 +166,7 @@ compile_plan() {
 
     # Mutation 1: Packages
     local need_packages=false
-    if ${PODMAN_PACKAGE_NEEDED} || ${UIDMAP_PACKAGE_NEEDED}; then
+    if ${PODMAN_PACKAGE_NEEDED} || ${UIDMAP_PACKAGE_NEEDED} || ${DOCKER_ROOTLESS_PACKAGE_NEEDED:-false}; then
         need_packages=true
     elif [[ "${OPSKIT_TEST_MODE:-0}" == "1" && "${OPSKIT_TEST_FORCE_PACKAGES:-0}" == "1" ]]; then
         need_packages=true
@@ -171,6 +181,12 @@ compile_plan() {
                 sles) pkgs+=("shadow") ;;
                 *) pkgs+=("uidmap") ;;
             esac
+        fi
+        if ${DOCKER_ROOTLESS_PACKAGE_NEEDED:-false}; then
+            local rd_pkg
+            for rd_pkg in $(family_rootless_docker_packages); do
+                pkgs+=("${rd_pkg}")
+            done
         fi
         if [[ ${#pkgs[@]} -eq 0 ]] && [[ "${OPSKIT_TEST_MODE:-0}" == "1" && "${OPSKIT_TEST_FORCE_PACKAGES:-0}" == "1" ]]; then
             case "${DETECTED_FAMILY}" in
@@ -216,6 +232,23 @@ compile_plan() {
         )
     fi
 
+    # Mutation 3b: Systemd cgroup v2 delegation (Delegate=yes)
+    # Upstream systemd resource control: https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html
+    local delegate_dropin="${SYSTEMD_SYSTEM_DIR}/user@.service.d/opskit-delegate.conf"
+    local need_cgroup_delegation=false
+    if ! ${CGROUP_DELEGATION_ENABLED}; then
+        need_cgroup_delegation=true
+    elif [[ -f "${delegate_dropin}" ]] && ! file_matches_expected "${delegate_dropin}" expected_cgroup_delegate_conf; then
+        need_cgroup_delegation=true
+    elif ! is_mutation_recorded "cgroup_delegation"; then
+        need_cgroup_delegation=true
+    fi
+    if ${need_cgroup_delegation}; then
+        PLAN_MUTATIONS+=(
+            "{\"id\":\"cgroup_delegation\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Enable systemd cgroup v2 delegation (Delegate=yes) for user slice '${SERVICE_USER}'\",\"target\":\"${delegate_dropin}\",\"rollback\":\"rm -f ${delegate_dropin} && systemctl daemon-reload\"}"
+        )
+    fi
+
     # Mutation 4: User linger (reconcile on Run 1 even if pre-existing)
     local need_linger=false
     if ! ${LINGER_ACTIVE} || ! is_mutation_recorded "user_linger"; then
@@ -225,6 +258,23 @@ compile_plan() {
         PLAN_MUTATIONS+=(
             "{\"id\":\"user_linger\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Enable systemd user linger for '${SERVICE_USER}' to allow background service execution\",\"target\":\"/var/lib/systemd/linger/${SERVICE_USER}\",\"rollback\":\"loginctl disable-linger ${SERVICE_USER}\"}"
         )
+    fi
+
+    # Mutation 4b: Rootless Docker provisioning (when Docker is selected)
+    # Upstream rootless Docker setup: https://docs.docker.com/engine/security/rootless/
+    if [[ "${DETECTED_RUNTIME}" == "docker" ]]; then
+        local docker_env_file="/home/${SERVICE_USER}/.config/environment.d/opskit-docker.conf"
+        local need_rootless_docker=false
+        if ! ${DOCKER_ROOTLESS_USABLE}; then
+            need_rootless_docker=true
+        elif ! is_mutation_recorded "rootless_docker"; then
+            need_rootless_docker=true
+        fi
+        if ${need_rootless_docker}; then
+            PLAN_MUTATIONS+=(
+                "{\"id\":\"rootless_docker\",\"class\":\"U\",\"requires_root\":false,\"description\":\"Provision rootless Docker daemon and DOCKER_HOST for '${SERVICE_USER}'\",\"target\":\"/home/${SERVICE_USER}/.config/systemd/user/docker.service, ${docker_env_file}\",\"rollback\":\"dockerd-rootless-setuptool.sh uninstall && rm -f ${docker_env_file}\"}"
+            )
+        fi
     fi
 
     # Mutations for direct profile
@@ -448,7 +498,7 @@ with open(sys.argv[1], 'r') as f:
     fi
     PLAN_EXPIRES_AT="${expires_at}"
 
-    local postcond_items=("\"service_user_rootless_functional\"")
+    local postcond_items=("\"service_user_rootless_functional\"" "\"cgroup_delegation_active\"")
     if [[ "${CHOSEN_PROFILE}" == "direct" && "${SYSTEMD_RUNNING}" == "true" ]]; then
         postcond_items+=("\"systemd_socket_units_active\"")
     fi
@@ -456,7 +506,7 @@ with open(sys.argv[1], 'r') as f:
     local postcond_json
     postcond_json="$(IFS=', '; echo "${postcond_items[*]}")"
 
-    PLAN_JSON="{\"schema\":\"opskit.bootstrap-plan/v1\",\"node_fingerprint\":\"$(json_escape "${NODE_FINGERPRINT}")\",\"capabilities\":{\"os_id\":\"$(json_escape "${OS_ID}")\",\"os_version\":\"$(json_escape "${OS_VERSION_ID}")\",\"os_name\":\"$(json_escape "${OS_NAME}")\",\"kernel\":\"$(json_escape "${KERNEL_RELEASE}")\",\"kernel_ok\":true,\"cgroups_v2\":${CGROUPS_V2},\"cgroup_controllers\":[${ctrl_json}],\"systemd_running\":${SYSTEMD_RUNNING},\"systemd_user_manager\":${SYSTEMD_USER_MANAGER},\"runtime\":\"$(json_escape "${DETECTED_RUNTIME}")\",\"runtime_version\":\"$(json_escape "${RUNTIME_VERSION}")\",\"newuidmap_present\":${NEWUIDMAP_PRESENT},\"newgidmap_present\":${NEWGIDMAP_PRESENT},\"subuid_allocated\":${SUBUID_ALLOCATED},\"subuid_range\":\"$(json_escape "${EXISTING_SUBUID_RANGE}")\",\"service_user_present\":${SERVICE_USER_EXISTS},\"selinux_status\":\"$(json_escape "${SELINUX_STATUS}")\",\"apparmor_status\":\"$(json_escape "${APPARMOR_STATUS}")\",\"firewall_stack\":\"$(json_escape "${FIREWALL_STACK}")\",\"disk_free_gb\":${DISK_FREE_GB},\"clock_skew_seconds\":${CLOCK_SKEW_SECONDS},\"linger_enabled\":${LINGER_ACTIVE}},\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\",\"runtime\":\"$(json_escape "${DETECTED_RUNTIME}")\",\"mutations\":[${mut_json}],\"no_changes\":${NO_CHANGES},\"probe_results\":{\"status\":\"$(json_escape "${PROBE_STATUS}")\",\"reachable_v4\":${PROBE_REACHABLE_V4},\"reachable_v6\":${PROBE_REACHABLE_V6},\"details\":\"$(json_escape "${PROBE_DETAILS}")\"},\"postconditions\":[${postcond_json}],\"expires_at\":\"${expires_at}\"}"
+    PLAN_JSON="{\"schema\":\"opskit.bootstrap-plan/v1\",\"node_fingerprint\":\"$(json_escape "${NODE_FINGERPRINT}")\",\"capabilities\":{\"os_id\":\"$(json_escape "${OS_ID}")\",\"os_version\":\"$(json_escape "${OS_VERSION_ID}")\",\"os_name\":\"$(json_escape "${OS_NAME}")\",\"kernel\":\"$(json_escape "${KERNEL_RELEASE}")\",\"kernel_ok\":true,\"cgroups_v2\":${CGROUPS_V2},\"cgroup_controllers\":[${ctrl_json}],\"systemd_running\":${SYSTEMD_RUNNING},\"systemd_user_manager\":${SYSTEMD_USER_MANAGER},\"runtime\":\"$(json_escape "${DETECTED_RUNTIME}")\",\"runtime_version\":\"$(json_escape "${RUNTIME_VERSION}")\",\"newuidmap_present\":${NEWUIDMAP_PRESENT},\"newgidmap_present\":${NEWGIDMAP_PRESENT},\"subuid_allocated\":${SUBUID_ALLOCATED},\"subuid_range\":\"$(json_escape "${EXISTING_SUBUID_RANGE}")\",\"service_user_present\":${SERVICE_USER_EXISTS},\"selinux_status\":\"$(json_escape "${SELINUX_STATUS}")\",\"apparmor_status\":\"$(json_escape "${APPARMOR_STATUS}")\",\"firewall_stack\":\"$(json_escape "${FIREWALL_STACK}")\",\"disk_free_gb\":${DISK_FREE_GB},\"clock_skew_seconds\":${CLOCK_SKEW_SECONDS},\"linger_enabled\":${LINGER_ACTIVE},\"docker_rootless_usable\":${DOCKER_ROOTLESS_USABLE},\"docker_daemon_rootful\":${DOCKER_DAEMON_ROOTFUL},\"cgroup_delegation_enabled\":${CGROUP_DELEGATION_ENABLED}},\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\",\"runtime\":\"$(json_escape "${DETECTED_RUNTIME}")\",\"mutations\":[${mut_json}],\"no_changes\":${NO_CHANGES},\"probe_results\":{\"status\":\"$(json_escape "${PROBE_STATUS}")\",\"reachable_v4\":${PROBE_REACHABLE_V4},\"reachable_v6\":${PROBE_REACHABLE_V6},\"details\":\"$(json_escape "${PROBE_DETAILS}")\"},\"postconditions\":[${postcond_json}],\"expires_at\":\"${expires_at}\"}"
 
     PLAN_HASH="$(compute_sha256 "${PLAN_JSON}")"
 }

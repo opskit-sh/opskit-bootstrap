@@ -2,6 +2,16 @@
 # Debian family package and system configuration adapter (Debian 13+, Ubuntu 24.04+).
 set -euo pipefail
 
+family_rootless_docker_packages() {
+    # Upstream rootless Docker extras package for Debian/Ubuntu:
+    # https://docs.docker.com/engine/security/rootless/
+    local pkgs=("docker-ce-rootless-extras")
+    if ! command -v slirp4netns >/dev/null 2>&1 && ! command -v pasta >/dev/null 2>&1; then
+        pkgs+=("slirp4netns")
+    fi
+    echo "${pkgs[*]}"
+}
+
 family_install_packages() {
     local pkgs=("$@")
     if [[ ${#pkgs[@]} -eq 0 ]]; then

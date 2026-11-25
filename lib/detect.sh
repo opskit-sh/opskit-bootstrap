@@ -170,9 +170,19 @@ detect_capabilities() {
 
     # Container runtime discovery
     RUNTIME_CHOICE="${FLAG_RUNTIME:-auto}"
+    case "${RUNTIME_CHOICE}" in
+        auto|podman|docker) ;;
+        *)
+            die "${EXIT_USAGE_ERROR}" "Invalid runtime '${RUNTIME_CHOICE}'. Valid runtimes are: auto, podman, docker."
+            ;;
+    esac
     DETECTED_RUNTIME=""
     RUNTIME_VERSION=""
     PODMAN_PACKAGE_NEEDED=false
+    DOCKER_ROOTLESS_USABLE=false
+    DOCKER_DAEMON_ROOTFUL=false
+    DOCKER_ROOTLESS_PACKAGE_NEEDED=false
+    CGROUP_DELEGATION_ENABLED=false
 
     if [[ "${RUNTIME_CHOICE}" == "docker" ]]; then
         if command -v docker >/dev/null 2>&1; then
@@ -274,6 +284,82 @@ detect_capabilities() {
     LINGER_ACTIVE=false
     if [[ -d "/var/lib/systemd/linger" ]] && [[ -f "/var/lib/systemd/linger/${SERVICE_USER}" ]]; then
         LINGER_ACTIVE=true
+    fi
+
+    # Rootless Docker capability detection (when Docker runtime is selected)
+    # Upstream rootless Docker socket and SecurityOptions verification:
+    # https://docs.docker.com/engine/security/rootless/
+    if [[ "${DETECTED_RUNTIME}" == "docker" ]]; then
+        if [[ "${OPSKIT_TEST_MODE:-0}" == "1" && -n "${MOCK_DOCKER_ROOTLESS_USABLE:-}" ]]; then
+            if [[ "${MOCK_DOCKER_ROOTLESS_USABLE}" == "true" ]]; then
+                DOCKER_ROOTLESS_USABLE=true
+                DOCKER_DAEMON_ROOTFUL=false
+            else
+                DOCKER_ROOTLESS_USABLE=false
+                DOCKER_DAEMON_ROOTFUL=true
+            fi
+        else
+            if [[ -S /var/run/docker.sock || -S /run/docker.sock ]] || pgrep -u root -x dockerd >/dev/null 2>&1 || systemctl is-active --quiet docker 2>/dev/null; then
+                DOCKER_DAEMON_ROOTFUL=true
+            elif command -v dockerd >/dev/null 2>&1; then
+                DOCKER_DAEMON_ROOTFUL=true
+            fi
+
+            if ${SERVICE_USER_EXISTS}; then
+                local svc_uid candidate_sock
+                svc_uid="$(id -u "${SERVICE_USER}")"
+                candidate_sock="$(resolve_service_user_docker_socket "${SERVICE_USER}")"
+                if [[ -n "${candidate_sock}" && -S "${candidate_sock}" ]]; then
+                    local probed_opts=""
+                    if [[ "${EUID}" -eq 0 ]]; then
+                        probed_opts="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' DOCKER_HOST='unix://${candidate_sock}' docker info --format '{{.SecurityOptions}}'" 2>/dev/null || true)"
+                    elif [[ "$(id -un 2>/dev/null || true)" == "${SERVICE_USER}" ]]; then
+                        probed_opts="$(HOME="/home/${SERVICE_USER}" XDG_RUNTIME_DIR="/run/user/${svc_uid}" DOCKER_HOST="unix://${candidate_sock}" docker info --format '{{.SecurityOptions}}' 2>/dev/null || true)"
+                    else
+                        # Non-root dry-run inspecting another user's rootless socket
+                        probed_opts="rootless"
+                    fi
+                    if [[ "${probed_opts}" == *"rootless"* ]]; then
+                        DOCKER_ROOTLESS_USABLE=true
+                    fi
+                fi
+            fi
+
+            if ! ${DOCKER_ROOTLESS_USABLE}; then
+                if ! command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1 || ! command -v rootlesskit >/dev/null 2>&1; then
+                    DOCKER_ROOTLESS_PACKAGE_NEEDED=true
+                fi
+            fi
+        fi
+    fi
+
+    # Systemd user slice cgroup v2 delegation detection
+    # Upstream systemd cgroup delegation and rootless container requirements:
+    # https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html
+    # https://rootlesscontaine.rs/getting-started/common/cgroup2/
+    if [[ "${OPSKIT_TEST_MODE:-0}" == "1" && -n "${MOCK_CGROUP_DELEGATION:-}" ]]; then
+        if [[ "${MOCK_CGROUP_DELEGATION}" == "true" ]]; then
+            CGROUP_DELEGATION_ENABLED=true
+        else
+            CGROUP_DELEGATION_ENABLED=false
+        fi
+    else
+        local svc_uid_cg=""
+        if ${SERVICE_USER_EXISTS}; then
+            svc_uid_cg="$(id -u "${SERVICE_USER}")"
+        fi
+        if has_systemd_delegate_yes "${svc_uid_cg}"; then
+            CGROUP_DELEGATION_ENABLED=true
+            if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1 && [[ -n "${svc_uid_cg}" ]]; then
+                if systemctl is-active --quiet "user@${svc_uid_cg}.service" 2>/dev/null; then
+                    local del_ctrls=""
+                    del_ctrls="$(systemctl show "user@${svc_uid_cg}.service" -p DelegateControllers --value 2>/dev/null || true)"
+                    if [[ "${del_ctrls}" != *"memory"* || "${del_ctrls}" != *"cpu"* || "${del_ctrls}" != *"pids"* ]]; then
+                        CGROUP_DELEGATION_ENABLED=false
+                    fi
+                fi
+            fi
+        fi
     fi
 
     # Security modules audit (never disabled)

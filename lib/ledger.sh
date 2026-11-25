@@ -136,7 +136,7 @@ sys.stdout.write(json.dumps(d, separators=(',', ':')))
 import json, sys
 try:
     d = json.loads(sys.argv[1])
-    known = {'packages', 'service_user', 'subuid_allocation', 'user_linger', 'edge_socket_units', 'edge_system_unit', 'firewall_rules', 'service_units', 'cloudflared_unit', 'security_labels', 'fetch_cli'}
+    known = {'packages', 'service_user', 'subuid_allocation', 'cgroup_delegation', 'user_linger', 'rootless_docker', 'edge_socket_units', 'edge_system_unit', 'firewall_rules', 'service_units', 'cloudflared_unit', 'security_labels', 'fetch_cli'}
     if d.get('mutation_id') not in known:
         print('unknown mutation_id')
         sys.exit(1)
@@ -202,7 +202,7 @@ verify_ledger_line() {
 import json, sys
 try:
     d = json.loads(sys.argv[1])
-    known = {'packages', 'service_user', 'subuid_allocation', 'user_linger', 'edge_socket_units', 'edge_system_unit', 'firewall_rules', 'service_units', 'cloudflared_unit', 'security_labels', 'fetch_cli'}
+    known = {'packages', 'service_user', 'subuid_allocation', 'cgroup_delegation', 'user_linger', 'rootless_docker', 'edge_socket_units', 'edge_system_unit', 'firewall_rules', 'service_units', 'cloudflared_unit', 'security_labels', 'fetch_cli'}
     mut_id = d.get('mutation_id')
     if not mut_id:
         print('missing mutation_id'); sys.exit(1)

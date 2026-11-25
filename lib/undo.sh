@@ -178,6 +178,55 @@ _undo_mutations_locked() {
                 fi
                 ;;
 
+            rootless_docker)
+                if [[ "${FLAG_PURGE:-}" == "true" ]]; then
+                    local rd_created
+                    rd_created="$(python3 -B -c "import json, sys; d=json.loads(sys.argv[1]); print(str(bool(d.get('created', False))).lower() if isinstance(d, dict) else 'false')" "${meta_json}" 2>/dev/null || echo false)"
+                    if [[ "${rd_created}" == "true" ]]; then
+                        if id "${SERVICE_USER}" >/dev/null 2>&1; then
+                            local svc_uid
+                            svc_uid="$(id -u "${SERVICE_USER}")"
+                            if command -v systemctl >/dev/null 2>&1; then
+                                systemctl --user --machine="${SERVICE_USER}@" disable --now docker.service docker.socket 2>/dev/null || true
+                            fi
+                            if command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1; then
+                                su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/${svc_uid}/bus' dockerd-rootless-setuptool.sh uninstall" 201>&- 2>/dev/null || true
+                            fi
+                        fi
+                        rm -f "/home/${SERVICE_USER}/.config/systemd/user/docker.service" \
+                              "/home/${SERVICE_USER}/.config/systemd/user/docker.socket" \
+                              "/home/${SERVICE_USER}/.config/environment.d/opskit-docker.conf" 2>/dev/null || true
+                        rmdir "/home/${SERVICE_USER}/.config/environment.d" 2>/dev/null || true
+                        log_info "Removed rootless Docker provisioning for '${SERVICE_USER}' (purge covenant)."
+                    else
+                        log_info "Preserved pre-existing rootless Docker configuration for '${SERVICE_USER}'."
+                    fi
+                else
+                    log_info "Preserved rootless Docker configuration for '${SERVICE_USER}' (plain covenant preserves workload execution)."
+                fi
+                ;;
+
+            cgroup_delegation)
+                if [[ "${FLAG_PURGE:-}" == "true" ]]; then
+                    local cg_created cg_dropin
+                    cg_created="$(python3 -B -c "import json, sys; d=json.loads(sys.argv[1]); print(str(bool(d.get('created', False))).lower() if isinstance(d, dict) else 'false')" "${meta_json}" 2>/dev/null || echo false)"
+                    cg_dropin="$(python3 -B -c "import json, sys; d=json.loads(sys.argv[1]); print(d.get('dropin', '') if isinstance(d, dict) else '')" "${meta_json}" 2>/dev/null || true)"
+                    [[ -z "${cg_dropin}" ]] && cg_dropin="${SYSTEMD_SYSTEM_DIR}/user@.service.d/opskit-delegate.conf"
+                    if [[ "${cg_created}" == "true" ]]; then
+                        rm -f "${cg_dropin}"
+                        rmdir "$(dirname "${cg_dropin}")" 2>/dev/null || true
+                        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+                            systemctl daemon-reload 2>/dev/null || true
+                        fi
+                        log_info "Removed systemd cgroup delegation drop-in '${cg_dropin}' (purge covenant)."
+                    else
+                        log_info "Preserved pre-existing systemd cgroup delegation configuration."
+                    fi
+                else
+                    log_info "Preserved systemd cgroup delegation configuration (plain covenant preserves workload resource limits)."
+                fi
+                ;;
+
             subuid_allocation)
                 if [[ "${FLAG_PURGE:-}" == "true" ]]; then
                     local alloc_flags sub_all sub_uid sub_gid

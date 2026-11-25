@@ -17,6 +17,7 @@ TEST_SCRIPTS=(
     "${REPO_ROOT}/tests/acceptance_uninstall.sh"
     "${REPO_ROOT}/tests/acceptance_privilege_audit.sh"
     "${REPO_ROOT}/tests/acceptance_os_matrix.sh"
+    "${REPO_ROOT}/tests/acceptance_docker_rootless.sh"
 )
 
 TOTAL=${#TEST_SCRIPTS[@]}

@@ -34,6 +34,12 @@ apply_mutations() {
                 sles) pkgs+=("shadow") ;;
             esac
         fi
+        if ${DOCKER_ROOTLESS_PACKAGE_NEEDED:-false}; then
+            local rd_pkg
+            for rd_pkg in $(family_rootless_docker_packages); do
+                pkgs+=("${rd_pkg}")
+            done
+        fi
         if [[ ${#pkgs[@]} -eq 0 ]] && [[ "${OPSKIT_TEST_MODE:-0}" == "1" && "${OPSKIT_TEST_FORCE_PACKAGES:-0}" == "1" ]]; then
             case "${DETECTED_FAMILY}" in
                 debian) pkgs=("podman" "uidmap") ;;
@@ -41,7 +47,12 @@ apply_mutations() {
                 sles) pkgs=("podman" "shadow") ;;
             esac
         fi
-        family_install_packages "${pkgs[@]}"
+        family_install_packages "${pkgs[@]}" || die "${EXIT_RUNTIME_ERROR}" "Failed to install required container runtime packages: ${pkgs[*]}."
+        if [[ "${DETECTED_RUNTIME}" == "docker" ]] && ! ${DOCKER_ROOTLESS_USABLE:-false}; then
+            if ! command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1 || ! command -v rootlesskit >/dev/null 2>&1; then
+                die "${EXIT_VALIDATION_ERROR}" "Rootless Docker setup tools (dockerd-rootless-setuptool.sh and rootlesskit) are unavailable after package installation; cannot convert pre-installed Docker to rootless mode."
+            fi
+        fi
         local pkgs_json
         pkgs_json="$(python3 -B -c "import json, sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${pkgs[@]}")"
         record_mutation "packages" "H" "absent" "installed" "${PLAN_HASH}" "{\"packages\":${pkgs_json},\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
@@ -83,6 +94,11 @@ apply_mutations() {
         allocate_subordinate_ids "${user_created_by_opskit}" "${pre_apply_sysusers_marker}"
     fi
 
+    # 3b. Systemd cgroup v2 delegation (before linger starts user@.service)
+    if is_mutation_planned "cgroup_delegation"; then
+        apply_cgroup_delegation
+    fi
+
     # 4. User linger (anchor ownership to pre-apply LINGER_ACTIVE verdict)
     if is_mutation_planned "user_linger"; then
         if ${LINGER_ACTIVE:-false} && ! ${pre_apply_sysusers_marker}; then
@@ -116,6 +132,11 @@ apply_mutations() {
         chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "/home/${SERVICE_USER}/.config"
     fi
 
+    # 4b. Rootless Docker provisioning (when Docker is selected)
+    if [[ "${DETECTED_RUNTIME}" == "docker" ]] && is_mutation_planned "rootless_docker"; then
+        provision_rootless_docker
+    fi
+
     # 5. Direct profile: root socket units & system unit & firewall
     if [[ "${CHOSEN_PROFILE}" == "direct" ]]; then
         is_mutation_planned "edge_socket_units" && install_edge_socket_units
@@ -143,6 +164,9 @@ apply_mutations() {
         local before_fp="${CLI_MUTATION_BEFORE_FP:-absent}"
         record_mutation "fetch_cli" "H" "${before_fp}" "${after_fp}" "${PLAN_HASH}" "${CLI_MUTATION_METADATA}"
     fi
+
+    # 12. Fail-closed runtime and cgroup delegation verification
+    verify_rootless_runtime_and_delegation
 
     # Vendor uninstaller and state
     vendor_uninstaller
@@ -361,4 +385,216 @@ apply_security_labels() {
         chcon -R -t container_file_t "${SERVICE_STATE_DIR}" 2>/dev/null || true
     fi
     record_mutation "security_labels" "H" "default" "container_file_t" "${PLAN_HASH}" "{\"context\":\"container_file_t\",\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+}
+
+apply_cgroup_delegation() {
+    # Upstream systemd cgroup v2 delegation for per-user service managers:
+    # https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html
+    local dropin_dir="${SYSTEMD_SYSTEM_DIR}/user@.service.d"
+    local dropin_file="${dropin_dir}/opskit-delegate.conf"
+    local svc_uid=""
+    if id "${SERVICE_USER}" >/dev/null 2>&1; then
+        svc_uid="$(id -u "${SERVICE_USER}")"
+    fi
+
+    # Check if an administrator already configured Delegate=yes outside OpsKit's drop-in
+    if [[ ! -f "${dropin_file}" ]] && has_systemd_delegate_yes "${svc_uid}"; then
+        if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload 2>/dev/null || true
+            if [[ -n "${svc_uid}" ]] && systemctl is-active --quiet "user@${svc_uid}.service" 2>/dev/null; then
+                local del_ctrls=""
+                del_ctrls="$(systemctl show "user@${svc_uid}.service" -p DelegateControllers --value 2>/dev/null || true)"
+                if [[ "${del_ctrls}" != *"memory"* || "${del_ctrls}" != *"cpu"* || "${del_ctrls}" != *"pids"* ]]; then
+                    systemctl restart "user@${svc_uid}.service" || die "${EXIT_RUNTIME_ERROR}" "Failed to restart user@${svc_uid}.service to activate cgroup delegation."
+                fi
+            fi
+        fi
+        record_mutation "cgroup_delegation" "H" "present:admin" "present:delegate=yes" "${PLAN_HASH}" "{\"dropin\":\"${dropin_file}\",\"created\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+        log_info "Recorded pre-existing systemd cgroup delegation configuration (preserved on purge)."
+        return 0
+    fi
+
+    mkdir -p "${dropin_dir}"
+    chmod 0755 "${dropin_dir}"
+    expected_cgroup_delegate_conf > "${dropin_file}"
+    chmod 0644 "${dropin_file}"
+    if [[ "${EUID}" -eq 0 ]]; then
+        chown root:root "${dropin_file}"
+    fi
+
+    if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload
+        if [[ -n "${svc_uid}" ]] && systemctl is-active --quiet "user@${svc_uid}.service" 2>/dev/null; then
+            systemctl restart "user@${svc_uid}.service" || die "${EXIT_RUNTIME_ERROR}" "Failed to restart user@${svc_uid}.service to activate cgroup delegation."
+        fi
+    fi
+
+    record_mutation "cgroup_delegation" "H" "absent" "present:delegate=yes" "${PLAN_HASH}" "{\"dropin\":\"${dropin_file}\",\"created\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+    log_info "Configured systemd cgroup v2 delegation (Delegate=yes) at '${dropin_file}'."
+}
+
+provision_rootless_docker() {
+    # Upstream rootless Docker provisioning via dockerd-rootless-setuptool.sh:
+    # https://docs.docker.com/engine/security/rootless/
+    if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
+        die "${EXIT_VALIDATION_ERROR}" "Cannot provision rootless Docker: service user '${SERVICE_USER}' does not exist."
+    fi
+    local svc_uid
+    svc_uid="$(id -u "${SERVICE_USER}")"
+    local docker_env_dir="/home/${SERVICE_USER}/.config/environment.d"
+    local docker_env_file="${docker_env_dir}/opskit-docker.conf"
+
+    if ${DOCKER_ROOTLESS_USABLE:-false}; then
+        local existing_sock
+        existing_sock="$(resolve_service_user_docker_socket "${SERVICE_USER}")"
+        if [[ ! -f "${docker_env_file}" ]] && ! grep -qhE '^[[:space:]]*DOCKER_HOST=' "${docker_env_dir}"/*.conf 2>/dev/null; then
+            mkdir -p "${docker_env_dir}"
+            printf 'DOCKER_HOST=unix://%s\n' "${existing_sock:-/run/user/${svc_uid}/docker.sock}" > "${docker_env_file}"
+            chmod 0644 "${docker_env_file}"
+            chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${docker_env_dir}"
+        fi
+        record_mutation "rootless_docker" "U" "present:rootless" "present:rootless" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"socket\":\"${existing_sock:-/run/user/${svc_uid}/docker.sock}\",\"env_file\":\"${docker_env_file}\",\"created\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+        log_info "Recorded pre-existing rootless Docker setup for '${SERVICE_USER}' (preserved on purge)."
+        return 0
+    fi
+
+    if ! command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1 || ! command -v rootlesskit >/dev/null 2>&1; then
+        die "${EXIT_VALIDATION_ERROR}" "Cannot convert pre-installed Docker to rootless mode: dockerd-rootless-setuptool.sh or rootlesskit not found."
+    fi
+    if ! command -v newuidmap >/dev/null 2>&1 || ! command -v newgidmap >/dev/null 2>&1; then
+        die "${EXIT_VALIDATION_ERROR}" "Cannot convert pre-installed Docker to rootless mode: newuidmap/newgidmap not found."
+    fi
+    if ! grep -q "^${SERVICE_USER}:" "${SUBUID_FILE}" 2>/dev/null || ! grep -q "^${SERVICE_USER}:" "${SUBGID_FILE}" 2>/dev/null; then
+        die "${EXIT_VALIDATION_ERROR}" "Cannot convert pre-installed Docker to rootless mode: subordinate UID/GID mapping missing for '${SERVICE_USER}'."
+    fi
+
+    # Wait briefly for loginctl enable-linger to populate /run/user/<uid> when systemd + dbus are running
+    if ${SYSTEMD_RUNNING} && [[ -S /run/dbus/system_bus_socket ]]; then
+        local wait_i=0
+        while [[ ! -d "/run/user/${svc_uid}" && ${wait_i} -lt 10 ]]; do
+            sleep 0.5
+            wait_i=$((wait_i + 1))
+        done
+    fi
+
+    log_info "Provisioning rootless Docker for '${SERVICE_USER}' via dockerd-rootless-setuptool.sh..."
+    local xdg_rt_export=""
+    if [[ -d "/run/user/${svc_uid}" ]]; then
+        xdg_rt_export="export XDG_RUNTIME_DIR='/run/user/${svc_uid}' DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/${svc_uid}/bus'"
+    fi
+    local setup_out="" setup_rc=0
+    setup_out="$(su -s /bin/bash "${SERVICE_USER}" -c "
+        export HOME='/home/${SERVICE_USER}'
+        ${xdg_rt_export}
+        dockerd-rootless-setuptool.sh install
+    " 201>&- 2>&1)" || setup_rc=$?
+
+    if [[ ${setup_rc} -ne 0 ]]; then
+        die "${EXIT_RUNTIME_ERROR}" "Rootless Docker provisioning failed for '${SERVICE_USER}' (exit ${setup_rc}): ${setup_out}"
+    fi
+
+    # Persist DOCKER_HOST in systemd user environment.d
+    # Upstream environment.d(5): https://www.freedesktop.org/software/systemd/man/latest/environment.d.html
+    local rootless_sock="/run/user/${svc_uid}/docker.sock"
+    if [[ ! -d "/run/user/${svc_uid}" && -d "/home/${SERVICE_USER}/.docker/run" ]]; then
+        rootless_sock="/home/${SERVICE_USER}/.docker/run/docker.sock"
+    fi
+    mkdir -p "${docker_env_dir}"
+    printf 'DOCKER_HOST=unix://%s\n' "${rootless_sock}" > "${docker_env_file}"
+    chmod 0644 "${docker_env_file}"
+    chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${docker_env_dir}"
+
+    if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
+        systemctl --user --machine="${SERVICE_USER}@" set-environment "DOCKER_HOST=unix://${rootless_sock}" 2>/dev/null || true
+        if [[ -f "/home/${SERVICE_USER}/.config/systemd/user/docker.service" ]]; then
+            systemctl --user --machine="${SERVICE_USER}@" start docker.service 2>/dev/null || true
+        fi
+    fi
+
+    local sock_wait=0
+    while [[ ! -S "${rootless_sock}" && ${sock_wait} -lt 20 ]]; do
+        sleep 0.5
+        sock_wait=$((sock_wait + 1))
+    done
+
+    record_mutation "rootless_docker" "U" "absent" "present:rootless" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"socket\":\"${rootless_sock}\",\"env_file\":\"${docker_env_file}\",\"created\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+    log_info "Provisioned rootless Docker for '${SERVICE_USER}' at '${rootless_sock}'."
+}
+
+verify_rootless_runtime_and_delegation() {
+    if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
+        die "${EXIT_RUNTIME_ERROR}" "Runtime verification failed: service user '${SERVICE_USER}' does not exist."
+    fi
+    local svc_uid
+    svc_uid="$(id -u "${SERVICE_USER}")"
+
+    # 1. Verify cgroup delegation configuration and active systemd user delegation
+    if ! has_systemd_delegate_yes "${svc_uid}"; then
+        die "${EXIT_RUNTIME_ERROR}" "Cgroup delegation verification failed: Delegate=yes is not configured for user@.service."
+    fi
+    if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet "user@${svc_uid}.service" 2>/dev/null; then
+            local del_ctrls=""
+            del_ctrls="$(systemctl show "user@${svc_uid}.service" -p DelegateControllers --value 2>/dev/null || true)"
+            if [[ "${del_ctrls}" != *"memory"* || "${del_ctrls}" != *"cpu"* || "${del_ctrls}" != *"pids"* ]]; then
+                die "${EXIT_RUNTIME_ERROR}" "Cgroup delegation verification failed: user@${svc_uid}.service DelegateControllers='${del_ctrls}' lacks required memory/cpu/pids controllers."
+            fi
+        fi
+    fi
+
+    # 2. Verify chosen runtime is rootless-functional as SERVICE_USER (and memory limit enforced when an image is present)
+    if [[ "${DETECTED_RUNTIME}" == "docker" ]]; then
+        local sock
+        sock="$(resolve_service_user_docker_socket "${SERVICE_USER}")"
+        if [[ -z "${sock}" || ! -S "${sock}" ]]; then
+            die "${EXIT_RUNTIME_ERROR}" "Rootless Docker verification failed: rootless socket '${sock:-<unset>}' for '${SERVICE_USER}' does not exist. Cannot fall back to rootful /var/run/docker.sock."
+        fi
+        local sec_opts=""
+        sec_opts="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' DOCKER_HOST='unix://${sock}' docker info --format '{{.SecurityOptions}}'" 201>&- 2>/dev/null || true)"
+        if [[ "${sec_opts}" != *"rootless"* ]]; then
+            die "${EXIT_RUNTIME_ERROR}" "Rootless Docker verification failed: 'docker info' as '${SERVICE_USER}' on '${sock}' did not report rootless mode (SecurityOptions='${sec_opts}')."
+        fi
+
+        local verify_img="${OPSKIT_VERIFY_IMAGE:-}"
+        if [[ -z "${verify_img}" ]]; then
+            verify_img="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' DOCKER_HOST='unix://${sock}' docker images -q 2>/dev/null | head -n1" 201>&- || true)"
+        fi
+        if [[ -n "${verify_img}" ]]; then
+            local mem_out=""
+            mem_out="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' DOCKER_HOST='unix://${sock}' docker run --rm --network none --memory 33554432 '${verify_img}' sh -c 'cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null'" 201>&- 2>/dev/null | tr -d '[:space:]' || true)"
+            if [[ ! "${mem_out}" =~ ^[0-9]+$ ]] || [[ "${mem_out}" -gt 33554432 ]]; then
+                die "${EXIT_RUNTIME_ERROR}" "Rootless Docker cgroup memory limit verification failed (expected <= 33554432, got '${mem_out:-empty}')."
+            fi
+        fi
+        log_info "Verified rootless Docker functionality and cgroup delegation for '${SERVICE_USER}'."
+    elif [[ "${DETECTED_RUNTIME}" == "podman" ]]; then
+        if [[ "${OPSKIT_TEST_MODE:-0}" == "1" ]] && ! ${SYSTEMD_RUNNING} && [[ "${OPSKIT_FORCE_RUNTIME_VERIFY:-0}" != "1" ]]; then
+            command -v podman >/dev/null 2>&1 || die "${EXIT_RUNTIME_ERROR}" "Podman binary not found after bootstrap."
+            command -v newuidmap >/dev/null 2>&1 || die "${EXIT_RUNTIME_ERROR}" "newuidmap not found after bootstrap."
+            log_info "Verified cgroup delegation config and Podman prerequisites for '${SERVICE_USER}' (container test mode without systemd PID 1)."
+            return 0
+        fi
+        local rootless_flag=""
+        local podman_extra=""
+        rootless_flag="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' podman info --format '{{.Host.Security.Rootless}}'" 201>&- 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ "${rootless_flag}" != "true" && "${OPSKIT_TEST_MODE:-0}" == "1" ]]; then
+            podman_extra="--storage-driver vfs"
+            rootless_flag="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' podman ${podman_extra} info --format '{{.Host.Security.Rootless}}'" 201>&- 2>/dev/null | tr -d '[:space:]' || true)"
+        fi
+        if [[ "${rootless_flag}" != "true" ]]; then
+            die "${EXIT_RUNTIME_ERROR}" "Rootless Podman verification failed for '${SERVICE_USER}' (Rootless='${rootless_flag}')."
+        fi
+        local verify_img="${OPSKIT_VERIFY_IMAGE:-}"
+        if [[ -z "${verify_img}" ]]; then
+            verify_img="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' podman ${podman_extra} images -q 2>/dev/null | head -n1" 201>&- || true)"
+        fi
+        if [[ -n "${verify_img}" ]]; then
+            local mem_out=""
+            mem_out="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' podman ${podman_extra} run --rm --network none --memory 33554432 '${verify_img}' sh -c 'cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null'" 201>&- 2>/dev/null | tr -d '[:space:]' || true)"
+            if [[ ! "${mem_out}" =~ ^[0-9]+$ ]] || [[ "${mem_out}" -gt 33554432 ]]; then
+                die "${EXIT_RUNTIME_ERROR}" "Rootless Podman cgroup memory limit verification failed (expected <= 33554432, got '${mem_out:-empty}')."
+            fi
+        fi
+        log_info "Verified rootless Podman functionality and cgroup delegation for '${SERVICE_USER}'."
+    fi
 }

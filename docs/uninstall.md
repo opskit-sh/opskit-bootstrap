@@ -73,14 +73,15 @@ in reverse chronological order:
    `/etc/systemd/system/opskit-edge.service`, and executes `systemctl daemon-reload`.
 5. **Root socket units**: Stops `opskit-edge-443.socket` and `opskit-edge-80.socket`,
    disables them, removes the unit files, and executes `systemctl daemon-reload`.
-6. **Systemd user linger**: Under plain covenant, linger is preserved; under `--purge`,
+6. **Rootless Docker & cgroup delegation**: Under plain covenant, rootless Docker provisioning and systemd user slice cgroup delegation are preserved so existing container workloads continue operating with enforced resource limits; under `--purge`, OpsKit-provisioned `docker.service` / `opskit-docker.conf` and `/etc/systemd/system/user@.service.d/opskit-delegate.conf` are removed (pre-existing administrator configurations are preserved).
+7. **Systemd user linger**: Under plain covenant, linger is preserved; under `--purge`,
    disables linger via `loginctl disable-linger opskit` only if the ledger records it was enabled by OpsKit.
-7. **Subordinate IDs**: Under plain covenant, subordinate UID/GID mappings are preserved;
+8. **Subordinate IDs**: Under plain covenant, subordinate UID/GID mappings are preserved;
    under `--purge`, removes only the OpsKit-allocated `/etc/subuid` / `/etc/subgid` entries (preserving pre-existing ranges).
-8. **Service user**: Under plain covenant, the service account is preserved; under `--purge`,
+9. **Service user**: Under plain covenant, the service account is preserved; under `--purge`,
    removes user `opskit`, group `opskit`, drop-in `/etc/sysusers.d/opskit.conf` (preventing resurrection by `systemd-sysusers`),
    and `/home/opskit/` only when the ledger records the account was created by OpsKit (pre-existing admin accounts and home directories are preserved).
-9. **Bootstrap state**: Removes `/var/lib/opskit-bootstrap/` and all vendored libraries.
+10. **Bootstrap state**: Removes `/var/lib/opskit-bootstrap/` and all vendored libraries.
 
 ### Profile transitions and gate refusal during `--repair`
 

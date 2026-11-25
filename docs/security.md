@@ -39,10 +39,12 @@ and privileged boundaries enforced by `opskit-bootstrap`.
 
 | Mutation ID | Class | Target | Description |
 |---|---|---|---|
-| `packages` | Host (H) | Package manager | Install required runtime packages (`podman`, `uidmap`) if absent |
+| `packages` | Host (H) | Package manager | Install required runtime packages (`podman`, `uidmap`, or rootless Docker extras) if absent |
 | `service_user` | Host (H) | `/etc/passwd`, `/etc/group` | Provision dedicated service user and primary group |
 | `subuid_allocation` | Host (H) | `/etc/subuid`, `/etc/subgid` | Allocate subordinate user and group ID ranges |
+| `cgroup_delegation` | Host (H) | `/etc/systemd/system/user@.service.d/` | Enable `Delegate=yes` for systemd cgroup v2 controller delegation |
 | `user_linger` | Host (H) | Systemd linger directory | Enable linger via `loginctl enable-linger` for background services |
+| `rootless_docker` | User (U) | `~opskit/.config/systemd/user/`, `~opskit/.config/environment.d/` | Provision rootless Docker daemon and `DOCKER_HOST` when Docker is selected |
 | `edge_socket_units` | Host (H) | `/etc/systemd/system/` | Install `opskit-edge-443.socket` and `opskit-edge-80.socket` (direct profile) |
 | `edge_system_unit` | Host (H) | `/etc/systemd/system/` | Install `opskit-edge.service` with `User=opskit` (direct profile) |
 | `firewall_rules` | Host (H) | Host firewall stack | Allow TCP 443 and 80 traffic (direct profile) |

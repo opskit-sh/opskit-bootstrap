@@ -203,6 +203,11 @@ with open(sys.argv[1]) as f:
                         DRIFTED_ITEMS+=("packages: Missing user namespace utilities (newuidmap/newgidmap)")
                     fi
                     ;;
+                docker-ce-rootless-extras|docker-rootless-extras)
+                    if ! command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1 || ! command -v rootlesskit >/dev/null 2>&1; then
+                        DRIFTED_ITEMS+=("packages: Missing rootless Docker utilities (dockerd-rootless-setuptool.sh/rootlesskit)")
+                    fi
+                    ;;
             esac
         done
         if [[ -z "${pkgs_recorded}" ]]; then
@@ -223,6 +228,43 @@ with open(sys.argv[1]) as f:
     # Audit linger
     if [[ ! -f "/var/lib/systemd/linger/${SERVICE_USER}" ]]; then
         DRIFTED_ITEMS+=("user_linger: Systemd user linger is not active for '${SERVICE_USER}'")
+    fi
+
+    # Audit systemd cgroup delegation if recorded
+    if grep -q '"mutation_id":"cgroup_delegation"' "${LEDGER_FILE}"; then
+        local cg_created
+        cg_created="$(python3 -B -c "
+import json, sys
+with open(sys.argv[1], 'r') as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            d = json.loads(line)
+            if d.get('mutation_id') == 'cgroup_delegation':
+                print(str(bool(d.get('metadata', {}).get('created', False))).lower())
+        except Exception:
+            pass
+" "${LEDGER_FILE}" 2>/dev/null || echo false)"
+        local cg_dropin="${SYSTEMD_SYSTEM_DIR}/user@.service.d/opskit-delegate.conf"
+        if [[ "${cg_created}" == "true" ]]; then
+            if [[ ! -f "${cg_dropin}" ]]; then
+                DRIFTED_ITEMS+=("cgroup_delegation: Missing '${cg_dropin}'")
+            elif ! file_matches_expected "${cg_dropin}" expected_cgroup_delegate_conf; then
+                DRIFTED_ITEMS+=("cgroup_delegation: Content of '${cg_dropin}' has drifted from expected template")
+            fi
+        elif ! has_systemd_delegate_yes; then
+            DRIFTED_ITEMS+=("cgroup_delegation: Delegate=yes is no longer active for user@.service")
+        fi
+    fi
+
+    # Audit rootless Docker if recorded
+    if grep -q '"mutation_id":"rootless_docker"' "${LEDGER_FILE}"; then
+        local rd_sock
+        rd_sock="$(resolve_service_user_docker_socket "${SERVICE_USER}")"
+        if [[ -z "${rd_sock}" || ! -S "${rd_sock}" ]]; then
+            DRIFTED_ITEMS+=("rootless_docker: Rootless Docker socket '${rd_sock:-<unset>}' is missing or unreachable for '${SERVICE_USER}'")
+        fi
     fi
 
     # Audit subordinate IDs (both subuid and subgid)

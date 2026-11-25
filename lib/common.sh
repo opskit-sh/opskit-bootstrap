@@ -55,6 +55,10 @@ validate_test_hooks() {
         "MOCK_RUNTIME_VERSION"
         "MOCK_CGROUP_CONTROLLERS"
         "MOCK_APPARMOR_STATUS"
+        "MOCK_DOCKER_ROOTLESS_USABLE"
+        "MOCK_CGROUP_DELEGATION"
+        "OPSKIT_FORCE_RUNTIME_VERIFY"
+        "OPSKIT_VERIFY_IMAGE"
         "OPSKIT_TEST_FORCE_PACKAGES"
     )
     if [[ "${OPSKIT_TEST_MODE:-0}" != "1" ]]; then
@@ -117,6 +121,61 @@ compute_sha256() {
 # RFC 3339 UTC timestamp
 timestamp_rfc3339() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+# Check whether systemd user manager configuration enables Delegate=yes.
+# Upstream systemd resource control documentation:
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html
+has_systemd_delegate_yes() {
+    local uid="${1:-}"
+    local dirs=("${SYSTEMD_SYSTEM_DIR}/user@.service.d" "/usr/lib/systemd/system/user@.service.d")
+    if [[ -n "${uid}" ]]; then
+        dirs+=("${SYSTEMD_SYSTEM_DIR}/user@${uid}.service.d")
+    fi
+    local d f
+    for d in "${dirs[@]}"; do
+        [[ -d "${d}" ]] || continue
+        for f in "${d}"/*.conf; do
+            [[ -f "${f}" ]] || continue
+            if grep -qE '^[[:space:]]*Delegate[[:space:]]*=[[:space:]]*yes([[:space:]]|$)' "${f}" 2>/dev/null; then
+                return 0
+            fi
+        done
+    done
+    if [[ -f /usr/lib/systemd/system/user@.service ]] && grep -qE '^[[:space:]]*Delegate[[:space:]]*=[[:space:]]*yes([[:space:]]|$)' /usr/lib/systemd/system/user@.service 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Resolve the rootless Docker Unix socket path for the service user, never returning a rootful socket.
+# Upstream rootless Docker documentation: https://docs.docker.com/engine/security/rootless/
+resolve_service_user_docker_socket() {
+    local user="$1"
+    local uid=""
+    uid="$(id -u "${user}" 2>/dev/null || true)"
+    local candidate_sock=""
+    local env_dir="/home/${user}/.config/environment.d"
+    if [[ -d "${env_dir}" ]]; then
+        local env_host=""
+        env_host="$(grep -hE '^[[:space:]]*DOCKER_HOST=' "${env_dir}"/*.conf 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\"'[:space:]" || true)"
+        if [[ "${env_host}" == unix://* ]]; then
+            candidate_sock="${env_host#unix://}"
+        fi
+    fi
+    if [[ -z "${candidate_sock}" && -n "${uid}" ]]; then
+        if [[ -S "/run/user/${uid}/docker.sock" || -d "/run/user/${uid}" ]]; then
+            candidate_sock="/run/user/${uid}/docker.sock"
+        elif [[ -S "/home/${user}/.docker/run/docker.sock" ]]; then
+            candidate_sock="/home/${user}/.docker/run/docker.sock"
+        else
+            candidate_sock="/run/user/${uid}/docker.sock"
+        fi
+    fi
+    if [[ "${candidate_sock}" == "/var/run/docker.sock" || "${candidate_sock}" == "/run/docker.sock" ]]; then
+        candidate_sock=""
+    fi
+    printf '%s' "${candidate_sock}"
 }
 
 # Compare an on-disk file against a generator command's stdout using SHA-256
