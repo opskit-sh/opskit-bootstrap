@@ -3111,6 +3111,11 @@ export OPSKIT_SUBUID_COUNT="50000"
 
 systemctl is-active --quiet opskit-edge-443.socket
 systemctl is-active --quiet opskit-edge-80.socket
+# L-24 regression: fresh bootstrap leaves :443 and :80 actively listening with zero manual restart
+test "$(systemctl show -p SubState --value opskit-edge-443.socket)" = "listening"
+test "$(systemctl show -p SubState --value opskit-edge-80.socket)" = "listening"
+ss -Htlpn | awk "\$4 ~ /(^|:|\\])443\$/ { found=1 } END { exit !found }"
+ss -Htlpn | awk "\$4 ~ /(^|:|\\])80\$/ { found=1 } END { exit !found }"
 
 # Trigger socket activation via inherited :80 FD under ProtectHome=yes
 health_http="$(curl -sf --max-time 5 http://127.0.0.1:80/health)"
@@ -3132,6 +3137,36 @@ test "$(stat -c "%a:%U:%G" /var/lib/opskit/edge/config.json)" = "600:opskit:opsk
 test -S /var/lib/opskit/edge/health.sock
 health_unix="$(curl -sf --max-time 5 --unix-socket /var/lib/opskit/edge/health.sock http://localhost/health)"
 echo "${health_unix}" | grep -q "\"status\":\"ok\""
+
+# L-25 regression: CLI running as opskit with no manual env finds the same edge health socket & config
+test -f /home/opskit/.config/environment.d/opskit.conf
+test "$(stat -c "%a:%U:%G" /home/opskit/.config/environment.d/opskit.conf)" = "600:opskit:opskit"
+grep -q "^OPSKIT_EDGE_STATE_DIR=/var/lib/opskit/edge$" /home/opskit/.config/environment.d/opskit.conf
+grep -q "^XDG_STATE_HOME=/var/lib/opskit/state$" /home/opskit/.config/environment.d/opskit.conf
+grep -q "^XDG_CONFIG_HOME=/var/lib/opskit/config$" /home/opskit/.config/environment.d/opskit.conf
+test -L /home/opskit/.local/state/opskit/edge
+test "$(readlink /home/opskit/.local/state/opskit/edge)" = "/var/lib/opskit/edge"
+test -L /home/opskit/.config/opskit
+test "$(readlink /home/opskit/.config/opskit)" = "/var/lib/opskit/config/opskit"
+
+cli_health="$(runuser -u opskit -- env -i HOME=/home/opskit USER=opskit PATH=/usr/local/bin:/usr/bin:/bin \
+    curl -sf --max-time 5 --unix-socket /home/opskit/.local/state/opskit/edge/health.sock http://localhost/health)"
+echo "${cli_health}" | grep -q "\"status\":\"ok\""
+cli_prefs="$(runuser -u opskit -- env -i HOME=/home/opskit USER=opskit PATH=/usr/local/bin:/usr/bin:/bin \
+    cat /home/opskit/.config/opskit/config.json)"
+echo "${cli_prefs}" | grep -q "\"node-profile\":\"direct\""
+
+# L-24 re-run/repair regression: socket unit config change + daemon-reload drops FD, repair restores listening FD
+sed -i "s/^NonBlocking=true$/NonBlocking=false/" /etc/systemd/system/opskit-edge-443.socket
+systemctl daemon-reload
+set +e
+s443_drift="$(/bootstrap/bin/opskit-bootstrap --repair 2>&1)"
+s443_drift_rc=$?
+set -e
+test "${s443_drift_rc}" -eq 5
+echo "${s443_drift}" | grep -q "edge_socket_units"
+/bootstrap/bin/opskit-bootstrap --repair --yes >/dev/null
+ss -Htlpn | awk "\$4 ~ /(^|:|\\])443\$/ { found=1 } END { exit !found }"
 
 /var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
 ! systemctl is-active --quiet opskit-edge.service

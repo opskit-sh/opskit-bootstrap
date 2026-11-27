@@ -313,14 +313,17 @@ print(val)
         if [[ "${SYSTEMD_RUNNING:-false}" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
             local check_units=("opskit-edge-443.socket")
             [[ "${audit_http_80}" == "true" ]] && check_units+=("opskit-edge-80.socket")
-            local su
+            local su su_port
             for su in "${check_units[@]}"; do
+                su_port="443"
+                [[ "${su}" == "opskit-edge-80.socket" ]] && su_port="80"
                 if [[ -f "${SYSTEMD_SYSTEM_DIR}/${su}" ]]; then
                     if ! systemctl is-enabled --quiet "${su}" 2>/dev/null; then
                         DRIFTED_ITEMS+=("edge_socket_units: Unit '${su}' is not enabled")
-                    fi
-                    if ! systemctl is-active --quiet "${su}" 2>/dev/null; then
+                    elif ! systemctl is-active --quiet "${su}" 2>/dev/null; then
                         DRIFTED_ITEMS+=("edge_socket_units: Unit '${su}' is not active")
+                    elif ! is_socket_unit_healthy "${su}" "${su_port}"; then
+                        DRIFTED_ITEMS+=("edge_socket_units: Socket unit '${su}' lost its open FD or requires daemon-reload/restart (port ${su_port} not listening)")
                     fi
                 fi
             done

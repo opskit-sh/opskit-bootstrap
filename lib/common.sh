@@ -1075,3 +1075,46 @@ print(f'ok:{total_rules}:{opskit_port_rules}:{other_objects}')
             ;;
     esac
 }
+
+# Check whether any socket on the host is actively listening on TCP <port>.
+tcp_port_is_listening() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        if ss -Htlpn 2>/dev/null | awk -v p="${port}" '$4 ~ ("(^|:|\\])" p "$") { found=1; exit } END { exit !found }'; then
+            return 0
+        fi
+        return 1
+    fi
+    if [[ -r /proc/net/tcp || -r /proc/net/tcp6 ]]; then
+        local hex_port
+        hex_port="$(printf '%04X' "${port}")"
+        if awk -v hp="${hex_port}" 'NR > 1 { split($2, a, ":"); if (toupper(a[2]) == hp && $4 == "0A") { found=1; exit } } END { exit !found }' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Verify a systemd socket unit is enabled, active, synced, and holding an open TCP listener.
+# Upstream systemd.socket(5): https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html
+is_socket_unit_healthy() {
+    local unit="$1"
+    local port="$2"
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+    systemctl is-enabled --quiet "${unit}" 2>/dev/null || return 1
+    systemctl is-active --quiet "${unit}" 2>/dev/null || return 1
+    local need_reload substate listen_prop
+    need_reload="$(systemctl show -p NeedDaemonReload --value "${unit}" 2>/dev/null || true)"
+    [[ "${need_reload}" == "yes" ]] && return 1
+    substate="$(systemctl show -p SubState --value "${unit}" 2>/dev/null || true)"
+    case "${substate}" in
+        listening|running) ;;
+        *) return 1 ;;
+    esac
+    listen_prop="$(systemctl show -p Listen --value "${unit}" 2>/dev/null || true)"
+    [[ -z "${listen_prop}" ]] && return 1
+    tcp_port_is_listening "${port}" || return 1
+    return 0
+}

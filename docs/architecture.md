@@ -79,6 +79,11 @@ running a root daemon is achieved using systemd socket activation
 User-scope exposure units (`opskit-edge.service`, and `cloudflared.service` under
 `tunnel`) are provisioned for non-`direct` profiles; `opskit-cloud.service` is
 installed separately during control-plane enrollment (`opskit cloud connect`).
+To keep the `opskit` CLI aligned with the hardened service paths under
+`/var/lib/opskit`, bootstrap also writes user-owned environment configuration
+(`~/.config/environment.d/opskit.conf`, mode `0600`) and user-home links from
+`~/.local/state/opskit/edge` and `~/.config/opskit` to `/var/lib/opskit/edge`
+and `/var/lib/opskit/config/opskit`.
 
 ## 3. Host integration and distribution family modules
 

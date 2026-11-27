@@ -476,6 +476,27 @@ print(f'{str(u).lower()}|{str(g).lower()}|{rng}')
         esac
     done
 
+    # Clean user-scope CLI environment drop-in and state/config compatibility links before removing state dir
+    if id "${SERVICE_USER}" >/dev/null 2>&1; then
+        remove_user_file "${svc_home}/.config/environment.d/opskit.conf"
+        run_as_service_user '
+            svc_home="$1"
+            state_root="$2"
+            edge_link="${svc_home}/.local/state/opskit/edge"
+            if [ -L "${edge_link}" ] && [ "$(readlink "${edge_link}" 2>/dev/null || true)" = "${state_root}/edge" ]; then
+                rm -f -- "${edge_link}"
+            fi
+            cfg_link="${svc_home}/.config/opskit"
+            if [ -L "${cfg_link}" ] && [ "$(readlink "${cfg_link}" 2>/dev/null || true)" = "${state_root}/config/opskit" ]; then
+                rm -f -- "${cfg_link}"
+            fi
+            rmdir "${svc_home}/.local/state/opskit" 2>/dev/null || true
+            rmdir "${svc_home}/.local/state" 2>/dev/null || true
+            rmdir "${svc_home}/.local" 2>/dev/null || true
+            rmdir "${svc_home}/.config/environment.d" 2>/dev/null || true
+        ' "${svc_home}" "${SERVICE_STATE_DIR}" 2>/dev/null || true
+    fi
+
     # Handle service state directory based on covenant
     ensure_safe_dir_no_symlink "${SERVICE_STATE_DIR}"
     if [[ "${FLAG_PURGE:-}" == "true" ]]; then

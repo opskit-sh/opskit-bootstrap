@@ -374,9 +374,9 @@ compile_plan() {
         elif [[ "${FLAG_NO_HTTP:-false}" == "true" && -f "${s80_path}" ]]; then
             need_sockets=true
         elif [[ "${SYSTEMD_RUNNING:-false}" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
-            if ! systemctl is-enabled --quiet opskit-edge-443.socket 2>/dev/null || ! systemctl is-active --quiet opskit-edge-443.socket 2>/dev/null; then
+            if ! is_socket_unit_healthy opskit-edge-443.socket 443; then
                 need_sockets=true
-            elif [[ "${FLAG_NO_HTTP:-false}" != "true" ]] && { ! systemctl is-enabled --quiet opskit-edge-80.socket 2>/dev/null || ! systemctl is-active --quiet opskit-edge-80.socket 2>/dev/null; }; then
+            elif [[ "${FLAG_NO_HTTP:-false}" != "true" ]] && ! is_socket_unit_healthy opskit-edge-80.socket 80; then
                 need_sockets=true
             fi
         fi

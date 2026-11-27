@@ -148,6 +148,34 @@ apply_mutations() {
         if ! run_as_service_user 'test -f "$1"' "${service_prefs}" 2>/dev/null; then
             printf '{"node-profile":"%s"}\n' "$(json_escape "${CHOSEN_PROFILE}")" | write_user_file "${service_prefs}" 0600
         fi
+        local svc_home_pre user_env_file
+        svc_home_pre="$(resolve_service_user_home "${SERVICE_USER}")"
+        user_env_file="${svc_home_pre}/.config/environment.d/opskit.conf"
+        printf 'OPSKIT_EDGE_STATE_DIR=%s/edge\nXDG_STATE_HOME=%s/state\nXDG_CONFIG_HOME=%s/config\n' \
+            "${SERVICE_STATE_DIR}" "${SERVICE_STATE_DIR}" "${SERVICE_STATE_DIR}" | write_user_file "${user_env_file}" 0600
+        if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
+            systemctl --user --machine="${SERVICE_USER}@" set-environment \
+                "OPSKIT_EDGE_STATE_DIR=${SERVICE_STATE_DIR}/edge" \
+                "XDG_STATE_HOME=${SERVICE_STATE_DIR}/state" \
+                "XDG_CONFIG_HOME=${SERVICE_STATE_DIR}/config" 2>/dev/null || true
+        fi
+        # Link default user XDG state/config paths directly to ${SERVICE_STATE_DIR} so direct CLI
+        # invocations without environment.d sourcing share the same socket and config location.
+        run_as_service_user '
+            set -eu
+            svc_home="$1"
+            state_root="$2"
+            mkdir -p "${svc_home}/.local/state/opskit" "${svc_home}/.config"
+            chmod 0700 "${svc_home}/.local/state/opskit"
+            edge_link="${svc_home}/.local/state/opskit/edge"
+            if [ -L "${edge_link}" ] || [ ! -e "${edge_link}" ]; then
+                ln -sfn -- "${state_root}/edge" "${edge_link}"
+            fi
+            cfg_link="${svc_home}/.config/opskit"
+            if [ -L "${cfg_link}" ] || [ ! -e "${cfg_link}" ]; then
+                ln -sfn -- "${state_root}/config/opskit" "${cfg_link}"
+            fi
+        ' "${svc_home_pre}" "${SERVICE_STATE_DIR}"
     fi
 
     # User systemd config directory (created strictly as SERVICE_USER)
@@ -325,6 +353,9 @@ install_edge_system_unit() {
 
     if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload
+        if ! is_mutation_planned "edge_socket_units" && systemctl is-active --quiet opskit-edge.service 2>/dev/null; then
+            systemctl restart opskit-edge.service 2>/dev/null || true
+        fi
     fi
 
     local unit_sha
@@ -370,12 +401,28 @@ install_edge_socket_units() {
     fi
 
     if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
+        local restart_edge_after=false
+        if systemctl is-active --quiet opskit-edge.service 2>/dev/null; then
+            restart_edge_after=true
+            systemctl stop opskit-edge.service 2>/dev/null || true
+        fi
         systemctl daemon-reload
-        systemctl enable --now "${active_units[@]}"
-        local u
+        systemctl enable "${active_units[@]}"
+        systemctl restart "${active_units[@]}"
+        local u u_port
         for u in "${active_units[@]}"; do
-            systemctl is-active --quiet "${u}" || die "${EXIT_RUNTIME_ERROR}" "${u} failed to activate"
+            u_port="443"
+            [[ "${u}" == "opskit-edge-80.socket" ]] && u_port="80"
+            if ! is_socket_unit_healthy "${u}" "${u_port}"; then
+                local st ls_val
+                st="$(systemctl show -p SubState --value "${u}" 2>/dev/null || true)"
+                ls_val="$(systemctl show -p Listen --value "${u}" 2>/dev/null || true)"
+                die "${EXIT_RUNTIME_ERROR}" "${u} failed to bind listening FD on TCP ${u_port} (SubState='${st}', Listen='${ls_val}')"
+            fi
         done
+        if ${restart_edge_after}; then
+            systemctl start opskit-edge.service 2>/dev/null || true
+        fi
     fi
 
     local sha443 sha80="absent" combined_sha units_json sha_map_json
