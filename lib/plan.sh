@@ -224,7 +224,7 @@ compile_plan() {
 
     # Mutation 1: Packages
     local need_packages=false
-    if ${PODMAN_PACKAGE_NEEDED} || ${UIDMAP_PACKAGE_NEEDED} || ${DOCKER_ROOTLESS_PACKAGE_NEEDED:-false}; then
+    if ${PODMAN_PACKAGE_NEEDED} || ${UIDMAP_PACKAGE_NEEDED} || ${DOCKER_ROOTLESS_PACKAGE_NEEDED:-false} || ${SLIRP4NETNS_PACKAGE_NEEDED:-false}; then
         need_packages=true
     elif [[ "${OPSKIT_TEST_HOOKS_COMPILED}" == "1" && "${OPSKIT_TEST_MODE:-0}" == "1" && "${OPSKIT_TEST_FORCE_PACKAGES:-0}" == "1" ]]; then
         need_packages=true
@@ -232,6 +232,7 @@ compile_plan() {
     if ${need_packages}; then
         local pkgs=()
         ${PODMAN_PACKAGE_NEEDED} && pkgs+=("podman")
+        ${SLIRP4NETNS_PACKAGE_NEEDED:-false} && pkgs+=("slirp4netns")
         if ${UIDMAP_PACKAGE_NEEDED}; then
             case "${DETECTED_FAMILY}" in
                 debian) pkgs+=("uidmap") ;;

@@ -30,6 +30,7 @@ apply_mutations() {
     if is_mutation_planned "packages"; then
         local pkgs=()
         ${PODMAN_PACKAGE_NEEDED} && pkgs+=("podman")
+        ${SLIRP4NETNS_PACKAGE_NEEDED:-false} && pkgs+=("slirp4netns")
         if ${UIDMAP_PACKAGE_NEEDED}; then
             case "${DETECTED_FAMILY}" in
                 debian) pkgs+=("uidmap") ;;

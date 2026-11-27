@@ -199,6 +199,7 @@ detect_capabilities() {
     DOCKER_DAEMON_ROOTFUL=false
     DOCKER_ROOTLESS_PACKAGE_NEEDED=false
     CGROUP_DELEGATION_ENABLED=false
+    SLIRP4NETNS_PACKAGE_NEEDED=false
 
     if [[ "${RUNTIME_CHOICE}" == "docker" ]]; then
         if command -v docker >/dev/null 2>&1; then
@@ -247,6 +248,16 @@ detect_capabilities() {
     fi
     if ! ${NEWUIDMAP_PRESENT} || ! ${NEWGIDMAP_PRESENT}; then
         UIDMAP_PACKAGE_NEEDED=true
+    fi
+
+    # Rootless podman networking: podman's default rootless network backend is
+    # slirp4netns (pasta is only used when explicitly configured), so require
+    # slirp4netns when it is missing.
+    # Upstream rootless podman networking backends: https://rootlesscontaine.rs/getting-started/common/network/
+    if [[ "${DETECTED_RUNTIME}" == "podman" ]]; then
+        if ! command -v slirp4netns >/dev/null 2>&1; then
+            SLIRP4NETNS_PACKAGE_NEEDED=true
+        fi
     fi
 
     # Subuid and Subgid files (audit both before marking allocation complete)
