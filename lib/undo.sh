@@ -293,6 +293,10 @@ print(f'{pe}|{bp}|{ep}|{el}')
                             loginctl disable-linger "${SERVICE_USER}" 2>/dev/null || true
                         fi
                         rm -f "/var/lib/systemd/linger/${SERVICE_USER}" 2>/dev/null || true
+                        # Also disable podman.socket if it was enabled (podman runtime)
+                        if command -v systemctl >/dev/null 2>&1; then
+                            systemctl --user --machine="${SERVICE_USER}@" disable --now podman.socket 2>/dev/null || true
+                        fi
                         log_info "Disabled systemd user linger for '${SERVICE_USER}' (purge covenant)."
                     else
                         log_info "Preserved pre-existing systemd user linger for '${SERVICE_USER}'."

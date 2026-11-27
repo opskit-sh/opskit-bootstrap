@@ -121,6 +121,17 @@ apply_mutations() {
         fi
     fi
 
+    # Podman user socket (when podman is the chosen runtime)
+    if [[ "${DETECTED_RUNTIME}" == "podman" ]]; then
+        log_info "Enabling podman.socket for '${SERVICE_USER}'..."
+        if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
+            systemctl --user --machine="${SERVICE_USER}@" enable --now podman.socket 2>/dev/null || true
+            log_info "Enabled and started podman.socket for '${SERVICE_USER}'."
+        else
+            log_warn "Systemd not running or systemctl unavailable; podman.socket enable skipped (will be activated on first use)."
+        fi
+    fi
+
     # Create service state directory non-recursively (never create versions/current as a directory)
     ensure_safe_dir_no_symlink "${SERVICE_STATE_DIR}"
     if [[ ! -d "${SERVICE_STATE_DIR}" ]]; then
