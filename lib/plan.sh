@@ -91,6 +91,9 @@ Requires=${sock_deps}
 Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
+Environment=OPSKIT_EDGE_STATE_DIR=${SERVICE_STATE_DIR}/edge
+Environment=XDG_STATE_HOME=${SERVICE_STATE_DIR}/state
+Environment=XDG_CONFIG_HOME=${SERVICE_STATE_DIR}/config
 ExecStart=${SERVICE_STATE_DIR}/versions/current/opskit-edge
 Restart=on-failure
 RestartSec=2s

@@ -180,6 +180,9 @@ WantedBy=sockets.target
 Type=simple
 User=opskit
 Group=opskit
+Environment=OPSKIT_EDGE_STATE_DIR=/var/lib/opskit/edge
+Environment=XDG_STATE_HOME=/var/lib/opskit/state
+Environment=XDG_CONFIG_HOME=/var/lib/opskit/config
 ExecStart=/var/lib/opskit/versions/current/opskit-edge
 Restart=on-failure
 RestartSec=2s
@@ -187,7 +190,7 @@ LimitNOFILE=65536
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 ProtectSystem=strict
-ReadWritePaths=/var/lib/opskit/edge /var/lib/opskit/logs /var/lib/opskit/state
+ReadWritePaths=/var/lib/opskit
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

@@ -63,6 +63,9 @@ running a root daemon is achieved using systemd socket activation
    activating the socket units and declares `Requires=` and `After=` for the
    active socket unit(s).
 3. The service unit declares `User=opskit`, `Group=opskit`, `UMask=0027`,
+   `Environment=OPSKIT_EDGE_STATE_DIR=/var/lib/opskit/edge`,
+   `Environment=XDG_STATE_HOME=/var/lib/opskit/state`,
+   `Environment=XDG_CONFIG_HOME=/var/lib/opskit/config`,
    `NoNewPrivileges=yes`, empty capability sets, `ProtectSystem=strict`,
    `ReadWritePaths=/var/lib/opskit`, `ProtectHome=yes`, `PrivateTmp=yes`,
    `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, and `RestrictNamespaces=yes`

@@ -404,11 +404,25 @@ print(f'{str(u).lower()}|{str(g).lower()}|{rng}')
                         if id "${SERVICE_USER}" >/dev/null 2>&1; then
                             local del_uid
                             del_uid="$(id -u "${SERVICE_USER}")"
-                            if command -v loginctl >/dev/null 2>&1; then
-                                loginctl terminate-user "${SERVICE_USER}" 2>/dev/null || true
-                            fi
-                            if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-                                systemctl stop "user@${del_uid}.service" 2>/dev/null || true
+                            if [[ "${del_uid}" -ne 0 ]]; then
+                                if command -v loginctl >/dev/null 2>&1; then
+                                    loginctl terminate-user "${SERVICE_USER}" 2>/dev/null || true
+                                fi
+                                if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+                                    systemctl stop "user@${del_uid}.service" "user-${del_uid}.slice" 2>/dev/null || true
+                                fi
+                                if command -v pkill >/dev/null 2>&1; then
+                                    pkill -TERM -u "${SERVICE_USER}" 2>/dev/null || true
+                                    local _p_wait=0
+                                    while [[ ${_p_wait} -lt 20 ]] && pgrep -u "${SERVICE_USER}" >/dev/null 2>&1; do
+                                        sleep 0.1
+                                        _p_wait=$((_p_wait + 1))
+                                    done
+                                    if pgrep -u "${SERVICE_USER}" >/dev/null 2>&1; then
+                                        pkill -KILL -u "${SERVICE_USER}" 2>/dev/null || true
+                                        sleep 0.2
+                                    fi
+                                fi
                             fi
                             if ! userdel -r "${SERVICE_USER}" 2>/dev/null; then
                                 userdel "${SERVICE_USER}" 2>/dev/null || true

@@ -52,8 +52,13 @@ with open('${TEST_ARTIFACTS_DIR_V2}/release-manifest.json', 'w') as f:
     json.dump(d, f, indent=2)
 "
 
+ACTIVE_CIDS=()
 cleanup() {
-    rm -rf "${TEST_ARTIFACTS_DIR}" "${TEST_ARTIFACTS_DIR_V2}"
+    local cid
+    for cid in "${ACTIVE_CIDS[@]+"${ACTIVE_CIDS[@]}"}"; do
+        podman rm -f "${cid}" >/dev/null 2>&1 || true
+    done
+    rm -rf "${TEST_ARTIFACTS_DIR}" "${TEST_ARTIFACTS_DIR_V2}" "${LIVE_EDGE_ARTIFACTS_DIR:-}"
 }
 trap cleanup EXIT
 
@@ -2773,16 +2778,24 @@ grep -q "NonBlocking=true" /etc/systemd/system/opskit-edge-443.socket
 ! grep -q "PartOf=" /etc/systemd/system/opskit-edge-443.socket
 ! grep -q "SocketMode=" /etc/systemd/system/opskit-edge-443.socket
 
-# Verify hardened opskit-edge.service directives
+# Verify hardened opskit-edge.service directives and state/config paths
 svc="/etc/systemd/system/opskit-edge.service"
 grep -q "Requires=opskit-edge-443.socket" "${svc}"
 ! grep -q "opskit-edge-80.socket" "${svc}"
+grep -q "Environment=OPSKIT_EDGE_STATE_DIR=/var/lib/opskit/edge" "${svc}"
+grep -q "Environment=XDG_STATE_HOME=/var/lib/opskit/state" "${svc}"
+grep -q "Environment=XDG_CONFIG_HOME=/var/lib/opskit/config" "${svc}"
 grep -q "NoNewPrivileges=yes" "${svc}"
 grep -q "ProtectSystem=strict" "${svc}"
+grep -q "ReadWritePaths=/var/lib/opskit" "${svc}"
+grep -q "ProtectHome=yes" "${svc}"
 grep -q "PrivateTmp=yes" "${svc}"
 grep -q "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" "${svc}"
 grep -q "UMask=0027" "${svc}"
 ! grep -q "NonBlocking=true" "${svc}"
+test -f /var/lib/opskit/config/opskit/config.json
+test "$(stat -c "%a:%U:%G" /var/lib/opskit/config/opskit/config.json)" = "600:opskit:opskit"
+grep -q "\"node-profile\":\"direct\"" /var/lib/opskit/config/opskit/config.json
 
 # Verify versions/current is an atomic symlink to the active version directory containing opskit-edge
 test -d /var/lib/opskit/versions
@@ -2919,9 +2932,219 @@ echo "PASS: Inaccessible cwd execution and versioned opskit-edge lifecycle verif
 '
 }
 
+# Test 48: Live systemd socket activation under hardened opskit-edge.service serves /health
+test_direct_edge_active_and_serves_health_under_hardened_unit() {
+    echo "--- Test 48: Hardened opskit-edge.service becomes active and serves /health via socket FDs ---"
+    LIVE_EDGE_ARTIFACTS_DIR="$(mktemp -d)"
+    local live_art_dir="${LIVE_EDGE_ARTIFACTS_DIR}"
+    cp "${TEST_ARTIFACTS_DIR}/release"* "${TEST_ARTIFACTS_DIR}/opskit-"* "${live_art_dir}/"
+
+    local host_arch
+    host_arch="$(uname -m)"
+    cat << 'EDGEPY' > "${live_art_dir}/opskit-edge-linux-${host_arch}"
+#!/usr/bin/env python3
+import json
+import os
+import selectors
+import signal
+import socket
+import sys
+
+if os.geteuid() == 0:
+    sys.stderr.write("opskit-edge refuses to run as root.\n")
+    sys.exit(5)
+
+def resolve_state_dir():
+    for env_key, suffix in (
+        ("OPSKIT_EDGE_STATE_DIR", ()),
+        ("OPSKIT_HOME", ("edge",)),
+        ("XDG_STATE_HOME", ("opskit", "edge")),
+        ("HOME", (".local", "state", "opskit", "edge")),
+    ):
+        v = os.environ.get(env_key, "")
+        if v:
+            return os.path.join(v, *suffix)
+    return "/var/lib/opskit/edge"
+
+def resolve_prefs_path():
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME", "")
+    if xdg_cfg:
+        return os.path.join(xdg_cfg, "opskit", "config.json")
+    return os.path.join(os.environ.get("HOME", ""), ".config", "opskit", "config.json")
+
+state_dir = resolve_state_dir()
+prefs_path = resolve_prefs_path()
+
+try:
+    with open(prefs_path, "r", encoding="utf-8") as pf:
+        prefs = json.load(pf)
+except Exception as exc:
+    sys.stderr.write(f"opskit-edge: failed to read configuration file {prefs_path}: {exc}\n")
+    sys.exit(1)
+
+os.makedirs(state_dir, mode=0o700, exist_ok=True)
+os.chmod(state_dir, 0o700)
+
+cfg_path = os.path.join(state_dir, "config.json")
+fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as cf:
+    json.dump({"node_profile": prefs.get("node-profile", "direct"), "routes": []}, cf)
+
+pid_path = os.path.join(state_dir, "edge.pid")
+pfd = os.open(pid_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(pfd, "w", encoding="utf-8") as pf:
+    pf.write(f"{os.getpid()}\n")
+
+listen_pid = int(os.environ.get("LISTEN_PID", "0") or "0")
+listen_fds = int(os.environ.get("LISTEN_FDS", "0") or "0")
+fd_names = [n for n in os.environ.get("LISTEN_FDNAMES", "").split(":") if n]
+if listen_pid != os.getpid() or listen_fds < 1:
+    sys.stderr.write(f"opskit-edge: expected systemd LISTEN_FDS, got pid={listen_pid} fds={listen_fds}\n")
+    sys.exit(1)
+
+sel = selectors.DefaultSelector()
+listeners = []
+for idx in range(listen_fds):
+    sock = socket.socket(fileno=3 + idx)
+    sock.setblocking(False)
+    sel.register(sock, selectors.EVENT_READ, data="listener")
+    listeners.append(sock)
+
+health_sock_path = os.path.join(state_dir, "health.sock")
+if os.path.exists(health_sock_path):
+    os.unlink(health_sock_path)
+hsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+hsock.bind(health_sock_path)
+os.chmod(health_sock_path, 0o600)
+hsock.listen(16)
+hsock.setblocking(False)
+sel.register(hsock, selectors.EVENT_READ, data="listener")
+listeners.append(hsock)
+
+running = True
+def stop_handler(_signum, _frame):
+    global running
+    running = False
+
+signal.signal(signal.SIGTERM, stop_handler)
+signal.signal(signal.SIGINT, stop_handler)
+
+body_bytes = json.dumps({
+    "status": "ok",
+    "fds": fd_names,
+    "state_dir": state_dir,
+    "prefs_path": prefs_path,
+}, separators=(",", ":")).encode("utf-8")
+
+while running:
+    events = sel.select(timeout=0.5)
+    for key, _ in events:
+        conn, _ = key.fileobj.accept()
+        try:
+            conn.settimeout(2.0)
+            req = conn.recv(4096)
+            first_line = req.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+            if first_line.startswith("GET /health "):
+                hdr = (
+                    f"HTTP/1.1 200 OK\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(body_bytes)}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii")
+                conn.sendall(hdr + body_bytes)
+            else:
+                conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        finally:
+            conn.close()
+EDGEPY
+    chmod 0755 "${live_art_dir}/opskit-edge-linux-${host_arch}"
+
+    local tmp_key="${live_art_dir}/tmp.key"
+    openssl genpkey -algorithm ed25519 -out "${tmp_key}" 2>/dev/null
+    openssl pkey -in "${tmp_key}" -pubout -out "${live_art_dir}/release.pub" 2>/dev/null
+    python3 -B -c "
+import hashlib, json, os, subprocess
+d_dir = '${live_art_dir}'
+m_path = os.path.join(d_dir, 'release-manifest.json')
+m = json.load(open(m_path, 'r', encoding='utf-8'))
+ek = 'opskit-edge-linux-${host_arch}'
+data = open(os.path.join(d_dir, ek), 'rb').read()
+m['artifacts'][ek]['sha256'] = hashlib.sha256(data).hexdigest()
+m['artifacts'][ek]['size'] = len(data)
+m.pop('signatures', None)
+canon = json.dumps(m, separators=(',', ':'), sort_keys=True, ensure_ascii=False).encode('utf-8')
+cf = os.path.join(d_dir, 'canon.tmp')
+open(cf, 'wb').write(canon)
+sig = subprocess.run(['openssl', 'pkeyutl', '-sign', '-inkey', '${tmp_key}', '-rawin', '-in', cf], stdout=subprocess.PIPE, check=True).stdout.hex()
+os.remove(cf)
+m['signatures'] = [{'key_id': 'test-release-key-1', 'algorithm': 'ed25519', 'signature': sig}]
+open(m_path, 'w', encoding='utf-8').write(json.dumps(m, indent=2))
+"
+    rm -f "${tmp_key}"
+
+    local cid
+    cid="$(podman run -d --rm --privileged -v "${REPO_ROOT}:/bootstrap:ro" -v "${live_art_dir}:/artifacts:ro" localhost/opskit-test-debian:13 /sbin/init)"
+    ACTIVE_CIDS+=("${cid}")
+
+    local wait_i=0
+    while [[ ${wait_i} -lt 30 ]]; do
+        if podman exec "${cid}" systemctl list-units >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.5
+        wait_i=$((wait_i + 1))
+    done
+
+    podman exec "${cid}" /bin/bash -c '
+set -euo pipefail
+export OPSKIT_TEST_MODE="1"
+export MOCK_KERNEL_RELEASE="6.1.0-28-amd64"
+export MOCK_DISK_FREE_GB="50"
+export OPSKIT_SKIP_DISK_CHECK="1"
+export OPSKIT_ARTIFACT_SOURCE_DIR="/artifacts"
+export OPSKIT_RELEASE_PUBKEY="/artifacts/release.pub"
+export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
+export OPSKIT_SUBUID_START="10000"
+export OPSKIT_SUBUID_COUNT="50000"
+
+/bootstrap/bin/opskit-bootstrap --profile direct --no-probe --yes >/dev/null
+
+systemctl is-active --quiet opskit-edge-443.socket
+systemctl is-active --quiet opskit-edge-80.socket
+
+# Trigger socket activation via inherited :80 FD under ProtectHome=yes
+health_http="$(curl -sf --max-time 5 http://127.0.0.1:80/health)"
+echo "${health_http}" | grep -q "\"status\":\"ok\""
+echo "${health_http}" | grep -q "\"443\""
+echo "${health_http}" | grep -q "\"80\""
+echo "${health_http}" | grep -q "\"state_dir\":\"/var/lib/opskit/edge\""
+echo "${health_http}" | grep -q "\"prefs_path\":\"/var/lib/opskit/config/opskit/config.json\""
+
+systemctl is-active --quiet opskit-edge.service
+main_pid="$(systemctl show -p MainPID --value opskit-edge.service)"
+test -n "${main_pid}" && test "${main_pid}" -gt 0
+test "$(ps -o user= -p "${main_pid}" | tr -d "[:space:]")" = "opskit"
+test "$(systemctl show -p ProtectHome --value opskit-edge.service)" = "yes"
+test "$(systemctl show -p ProtectSystem --value opskit-edge.service)" = "strict"
+
+test -f /var/lib/opskit/edge/config.json
+test "$(stat -c "%a:%U:%G" /var/lib/opskit/edge/config.json)" = "600:opskit:opskit"
+test -S /var/lib/opskit/edge/health.sock
+health_unix="$(curl -sf --max-time 5 --unix-socket /var/lib/opskit/edge/health.sock http://localhost/health)"
+echo "${health_unix}" | grep -q "\"status\":\"ok\""
+
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
+! systemctl is-active --quiet opskit-edge.service
+test ! -d /var/lib/opskit
+'
+    podman rm -f "${cid}" >/dev/null 2>&1 || true
+    echo "PASS: Hardened opskit-edge.service activated, read config, bound inherited FDs, and served /health."
+}
+
 test_user_home_symlink_privesc_defense
 test_port80_conflict_no_http_and_unit_hardening
 test_repair_detects_unit_perms_and_dropins
 test_inaccessible_cwd_and_versioned_edge_install
+test_direct_edge_active_and_serves_health_under_hardened_unit
 
 echo "ALL OS MATRIX ACCEPTANCE TESTS PASSED."

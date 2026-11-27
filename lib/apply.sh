@@ -133,11 +133,21 @@ apply_mutations() {
     if id "${SERVICE_USER}" >/dev/null 2>&1; then
         run_as_service_user '
             set -eu
+            edge_dir="$1"
+            cfg_root="$2"
+            cfg_dir="$3"
+            shift 3
+            mkdir -p "${edge_dir}" "${cfg_root}" "${cfg_dir}"
+            chmod 0700 "${edge_dir}" "${cfg_root}" "${cfg_dir}"
             for d in "$@"; do
                 mkdir -p "$d"
                 chmod 0750 "$d"
             done
-        ' "${SERVICE_STATE_DIR}/edge" "${SERVICE_STATE_DIR}/versions" "${SERVICE_STATE_DIR}/logs" "${SERVICE_STATE_DIR}/state"
+        ' "${SERVICE_STATE_DIR}/edge" "${SERVICE_STATE_DIR}/config" "${SERVICE_STATE_DIR}/config/opskit" "${SERVICE_STATE_DIR}/versions" "${SERVICE_STATE_DIR}/logs" "${SERVICE_STATE_DIR}/state"
+        local service_prefs="${SERVICE_STATE_DIR}/config/opskit/config.json"
+        if ! run_as_service_user 'test -f "$1"' "${service_prefs}" 2>/dev/null; then
+            printf '{"node-profile":"%s"}\n' "$(json_escape "${CHOSEN_PROFILE}")" | write_user_file "${service_prefs}" 0600
+        fi
     fi
 
     # User systemd config directory (created strictly as SERVICE_USER)
@@ -663,10 +673,33 @@ verify_rootless_runtime_and_delegation() {
         fi
         local rootless_flag=""
         local podman_extra=""
-        rootless_flag="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman info --format "{{.Host.Security.Rootless}}"' "${svc_home}" "/run/user/${svc_uid}" 2>/dev/null | tr -d '[:space:]' || true)"
+        local podman_rt="/run/user/${svc_uid}"
+        rootless_flag="$(run_as_service_user '
+            HOME="$1"
+            export HOME
+            if [ -d "$2" ]; then
+                export XDG_RUNTIME_DIR="$2"
+            else
+                unset XDG_RUNTIME_DIR 2>/dev/null || true
+            fi
+            podman info --format "{{.Host.Security.Rootless}}"
+        ' "${svc_home}" "${podman_rt}" 2>/dev/null | tr -d '[:space:]' || true)"
         if [[ "${rootless_flag}" != "true" && "${OPSKIT_TEST_HOOKS_COMPILED}" == "1" && "${OPSKIT_TEST_MODE:-0}" == "1" ]]; then
+            local test_vfs_root="${svc_home}/.local/share/containers/vfs-storage"
+            local test_vfs_run="/tmp/opskit-podman-run-${svc_uid}"
             podman_extra="--storage-driver vfs"
-            rootless_flag="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman --storage-driver vfs info --format "{{.Host.Security.Rootless}}"' "${svc_home}" "/run/user/${svc_uid}" 2>/dev/null | tr -d '[:space:]' || true)"
+            rootless_flag="$(run_as_service_user '
+                HOME="$1"
+                export HOME
+                mkdir -p "$3" "$4"
+                chmod 0700 "$3" "$4"
+                if [ -d "$2" ]; then
+                    export XDG_RUNTIME_DIR="$2"
+                else
+                    export XDG_RUNTIME_DIR="$4"
+                fi
+                podman --storage-driver vfs --root "$3" --runroot "$4" info --format "{{.Host.Security.Rootless}}"
+            ' "${svc_home}" "${podman_rt}" "${test_vfs_root}" "${test_vfs_run}" 2>/dev/null | tr -d '[:space:]' || true)"
         fi
         if [[ "${rootless_flag}" != "true" ]]; then
             die "${EXIT_RUNTIME_ERROR}" "Rootless Podman verification failed for '${SERVICE_USER}' (Rootless='${rootless_flag}')."
@@ -676,9 +709,9 @@ verify_rootless_runtime_and_delegation() {
         [[ -n "${verify_img}" ]] && explicit_verify_img=true
         if [[ -z "${verify_img}" ]]; then
             if [[ -n "${podman_extra}" ]]; then
-                verify_img="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman --storage-driver vfs images -q 2>/dev/null | head -n1' "${svc_home}" "/run/user/${svc_uid}" 2>/dev/null || true)"
+                verify_img="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman --storage-driver vfs --root "$3" --runroot "$4" images -q 2>/dev/null | head -n1' "${svc_home}" "${podman_rt}" "${svc_home}/.local/share/containers/vfs-storage" "/tmp/opskit-podman-run-${svc_uid}" 2>/dev/null || true)"
             else
-                verify_img="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman images -q 2>/dev/null | head -n1' "${svc_home}" "/run/user/${svc_uid}" 2>/dev/null || true)"
+                verify_img="$(run_as_service_user 'HOME="$1"; [ -d "$2" ] && export XDG_RUNTIME_DIR="$2"; podman images -q 2>/dev/null | head -n1' "${svc_home}" "${podman_rt}" 2>/dev/null || true)"
             fi
         fi
         if [[ -n "${verify_img}" ]]; then
@@ -687,9 +720,9 @@ verify_rootless_runtime_and_delegation() {
             fi
             local mem_out=""
             if [[ -n "${podman_extra}" ]]; then
-                mem_out="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman --storage-driver vfs run --rm --network none --memory 33554432 --entrypoint "" "$3" /bin/sh -c "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null"' "${svc_home}" "/run/user/${svc_uid}" "${verify_img}" 2>/dev/null | tr -d '[:space:]' || true)"
+                mem_out="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman --storage-driver vfs --root "$3" --runroot "$4" run --rm --network none --memory 33554432 --entrypoint "" "$5" /bin/sh -c "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null"' "${svc_home}" "${podman_rt}" "${svc_home}/.local/share/containers/vfs-storage" "/tmp/opskit-podman-run-${svc_uid}" "${verify_img}" 2>/dev/null | tr -d '[:space:]' || true)"
             else
-                mem_out="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman run --rm --network none --memory 33554432 --entrypoint "" "$3" /bin/sh -c "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null"' "${svc_home}" "/run/user/${svc_uid}" "${verify_img}" 2>/dev/null | tr -d '[:space:]' || true)"
+                mem_out="$(run_as_service_user 'HOME="$1"; [ -d "$2" ] && export XDG_RUNTIME_DIR="$2"; podman run --rm --network none --memory 33554432 --entrypoint "" "$3" /bin/sh -c "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null"' "${svc_home}" "${podman_rt}" "${verify_img}" 2>/dev/null | tr -d '[:space:]' || true)"
             fi
             if [[ -n "${mem_out}" || ${explicit_verify_img} == true ]]; then
                 if [[ ! "${mem_out}" =~ ^[0-9]+$ ]] || [[ "${mem_out}" -gt 33554432 ]]; then
