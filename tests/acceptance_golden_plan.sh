@@ -5,6 +5,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+if [[ ! -f /.dockerenv && ! -f /run/.containerenv ]]; then
+    if id opskit >/dev/null 2>&1 || [[ -d /var/lib/opskit || -d /var/lib/opskit-bootstrap || -f /var/lib/systemd/linger/opskit || -f /etc/systemd/system/opskit-edge.service || -f /etc/systemd/system/user@.service.d/opskit-delegate.conf ]]; then
+        if command -v podman >/dev/null 2>&1 && podman image exists localhost/opskit-test-debian:13; then
+            exec podman run --rm -v "${REPO_ROOT}:/bootstrap:ro" localhost/opskit-test-debian:13 /bin/bash /bootstrap/tests/acceptance_golden_plan.sh
+        fi
+    fi
+fi
+
 BOOTSTRAP_BIN="${REPO_ROOT}/bin/opskit-bootstrap"
 FIXTURE_DIR="${REPO_ROOT}/tests/fixtures/golden"
 TEST_TEMP_DIR="$(mktemp -d)"

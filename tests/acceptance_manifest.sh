@@ -831,9 +831,68 @@ with open('${test_dir}/release-manifest.json', 'w') as f:
     echo "PASS: Multi-signature rotation and strict duplicate-key JSON rejection verified."
 }
 
+# Test 22: Direct profile rejects missing or tampered opskit-edge artifact before mutations
+test_direct_edge_artifact_validation() {
+    echo "--- Test 22: Direct-profile edge artifact verification and failure modes ---"
+    local test_dir="${TEST_TEMP_DIR}/direct_edge"
+    mkdir -p "${test_dir}"
+    cp "${FIXTURE_DIR}/release.pub" "${test_dir}/"
+    cp "${FIXTURE_DIR}/release.key_id" "${test_dir}/"
+    cp "${FIXTURE_DIR}/opskit-linux-"* "${test_dir}/"
+    cp "${FIXTURE_DIR}/opskit-edge-linux-"* "${test_dir}/"
+
+    local host_arch
+    host_arch="$(uname -m)"
+
+    # 22A: Tampered edge binary fails preflight with exit 8 under CHOSEN_PROFILE=direct
+    cp "${FIXTURE_DIR}/release-manifest.json" "${test_dir}/"
+    echo "TAMPERED" >> "${test_dir}/opskit-edge-linux-${host_arch}"
+    set +e
+    ( CHOSEN_PROFILE="direct" verify_local_manifest_preflight "${test_dir}/release-manifest.json" "${test_dir}/release.pub" "${host_arch}" ) >/dev/null 2>&1
+    local rc_tampered=$?
+    set -e
+    if [[ ${rc_tampered} -ne 8 ]]; then
+        echo "FAIL: tampered edge artifact was not rejected with exit 8 (got ${rc_tampered})" >&2
+        return 1
+    fi
+
+    # 22B: Manifest lacking opskit-edge-linux-<arch> rejects CHOSEN_PROFILE=direct with exit 8
+    local tmp_key="${TEST_TEMP_DIR}/direct_edge.key"
+    openssl genpkey -algorithm ed25519 -out "${tmp_key}" 2>/dev/null
+    openssl pkey -in "${tmp_key}" -pubout -out "${test_dir}/release.pub" 2>/dev/null
+    python3 -B -c "
+import json, subprocess, os
+with open('${FIXTURE_DIR}/release-manifest.json', 'r', encoding='utf-8') as f:
+    d = json.load(f)
+d['artifacts'] = {k: v for k, v in d['artifacts'].items() if not k.startswith('opskit-edge-linux-')}
+d.pop('signatures', None)
+canon = json.dumps(d, separators=(',', ':'), sort_keys=True, ensure_ascii=False).encode('utf-8')
+cf = '${test_dir}/canon.tmp'
+with open(cf, 'wb') as f:
+    f.write(canon)
+sig = subprocess.run(['openssl', 'pkeyutl', '-sign', '-inkey', '${tmp_key}', '-rawin', '-in', cf], stdout=subprocess.PIPE, check=True).stdout.hex()
+os.remove(cf)
+d['signatures'] = [{'key_id': 'test-release-key-1', 'algorithm': 'ed25519', 'signature': sig}]
+with open('${test_dir}/release-manifest.json', 'w', encoding='utf-8') as f:
+    json.dump(d, f)
+"
+    rm -f "${tmp_key}"
+    set +e
+    ( CHOSEN_PROFILE="direct" OPSKIT_RELEASE_PUBKEY="${test_dir}/release.pub" verify_local_manifest_preflight "${test_dir}/release-manifest.json" "${test_dir}/release.pub" "${host_arch}" ) >/dev/null 2>&1
+    local rc_missing=$?
+    set -e
+    if [[ ${rc_missing} -ne 8 ]]; then
+        echo "FAIL: manifest missing edge artifact was not rejected with exit 8 for direct profile (got ${rc_missing})" >&2
+        return 1
+    fi
+
+    echo "PASS: Direct-profile edge artifact verification and fail-closed rejection verified."
+}
+
 test_filename_path_traversal_rejection
 test_path_override_gating
 test_https_enforcement_and_production_bundle
 test_multisig_and_strict_json
+test_direct_edge_artifact_validation
 
 echo "ALL MANIFEST ACCEPTANCE TESTS PASSED."

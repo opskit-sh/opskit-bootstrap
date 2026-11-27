@@ -150,9 +150,18 @@ _undo_mutations_locked() {
 
         case "${mut_id}" in
             fetch_cli)
-                local pre_existing backup_path
-                pre_existing="$(python3 -B -c "import json, sys; print(str(json.loads(sys.argv[1]).get('pre_existing', False)).lower())" "${meta_json}")"
-                backup_path="$(python3 -B -c "import json, sys; print(json.loads(sys.argv[1]).get('backup_path', ''))" "${meta_json}")"
+                local cli_meta_vals pre_existing backup_path edge_path edge_current_link
+                cli_meta_vals="$(python3 -B -c "
+import json, sys
+d = json.loads(sys.argv[1])
+if not isinstance(d, dict): d = {}
+pe = 'true' if d.get('pre_existing', False) else 'false'
+bp = str(d.get('backup_path', '') or '')
+ep = str(d.get('edge_path', '') or '')
+el = str(d.get('edge_current_link', '') or '')
+print(f'{pe}|{bp}|{ep}|{el}')
+" "${meta_json}" 2>/dev/null || echo "false|||")"
+                IFS='|' read -r pre_existing backup_path edge_path edge_current_link <<< "${cli_meta_vals}"
 
                 if [[ "${pre_existing}" == "true" ]]; then
                     if [[ -n "${backup_path}" && -f "${backup_path}" ]]; then
@@ -165,6 +174,18 @@ _undo_mutations_locked() {
                 else
                     rm -f "${CLI_INSTALL_PATH}"
                     log_info "Removed static CLI binary at ${CLI_INSTALL_PATH}."
+                fi
+                if [[ -n "${edge_current_link}" || -n "${edge_path}" ]] && id "${SERVICE_USER}" >/dev/null 2>&1; then
+                    run_as_service_user '
+                        if [ -n "$1" ]; then
+                            rm -f -- "$1"
+                        fi
+                        if [ -n "$2" ]; then
+                            rm -f -- "$2"
+                            rmdir "$(dirname "$2")" 2>/dev/null || true
+                        fi
+                    ' "${edge_current_link}" "${edge_path}" 2>/dev/null || true
+                    log_info "Removed versioned opskit-edge binary and current symlink."
                 fi
                 reversed_ids+=("fetch_cli")
                 ;;

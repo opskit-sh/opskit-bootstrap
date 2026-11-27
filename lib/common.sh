@@ -240,23 +240,31 @@ run_as_service_user() {
     svc_home="$(resolve_service_user_home "${SERVICE_USER}")"
     if [[ "${EUID}" -eq 0 ]]; then
         if command -v runuser >/dev/null 2>&1; then
-            runuser -u "${SERVICE_USER}" -- env -u BASH_ENV -u ENV HOME="${svc_home}" USER="${SERVICE_USER}" LOGNAME="${SERVICE_USER}" /bin/sh -c "${script}" sh "$@" 200>&- 201>&-
+            local wrapped_script
+            wrapped_script=$'cd "${HOME:-/}" 2>/dev/null || cd /\n'"${script}"
+            ( cd / && runuser -u "${SERVICE_USER}" -- env -u BASH_ENV -u ENV -u PWD HOME="${svc_home}" USER="${SERVICE_USER}" LOGNAME="${SERVICE_USER}" /bin/sh -c "${wrapped_script}" sh "$@" ) 200>&- 201>&-
         else
             python3 -B -c '
 import os, pwd, sys
 pw = pwd.getpwnam(sys.argv[1])
+os.chdir("/")
 os.initgroups(pw.pw_name, pw.pw_gid)
 os.setgid(pw.pw_gid)
 os.setuid(pw.pw_uid)
-env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+try:
+    os.chdir(pw.pw_dir)
+except OSError:
+    os.chdir("/")
+env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV", "PWD")}
 env["HOME"] = pw.pw_dir
 env["USER"] = pw.pw_name
 env["LOGNAME"] = pw.pw_name
+env["PWD"] = os.getcwd()
 os.execvpe("/bin/sh", ["/bin/sh", "-c", sys.argv[2], "sh", *sys.argv[3:]], env)
 ' "${SERVICE_USER}" "${script}" "$@" 200>&- 201>&-
         fi
     elif [[ "$(id -un 2>/dev/null || true)" == "${SERVICE_USER}" ]]; then
-        env -u BASH_ENV -u ENV HOME="${svc_home}" /bin/sh -c "${script}" sh "$@" 200>&- 201>&-
+        ( cd "${svc_home}" 2>/dev/null || cd /; env -u BASH_ENV -u ENV -u PWD HOME="${svc_home}" /bin/sh -c "${script}" sh "$@" ) 200>&- 201>&-
     else
         die "${EXIT_SAFETY_GUARD}" "Cannot execute operation as service user '${SERVICE_USER}' without root privileges."
     fi

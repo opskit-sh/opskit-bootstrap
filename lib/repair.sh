@@ -388,16 +388,13 @@ print(val)
         fi
     fi
 
-    # Audit CLI binary (existence, executable permission, and recorded SHA-256 digest)
+    # Audit CLI binary and versioned opskit-edge binary (existence, executable permission, and recorded SHA-256 digests)
     if grep -q '"mutation_id":"fetch_cli"' "${LEDGER_FILE}"; then
-        if [[ ! -f "${CLI_INSTALL_PATH}" ]]; then
-            DRIFTED_ITEMS+=("fetch_cli: Missing executable at '${CLI_INSTALL_PATH}'")
-        elif [[ ! -x "${CLI_INSTALL_PATH}" ]]; then
-            DRIFTED_ITEMS+=("fetch_cli: Binary at '${CLI_INSTALL_PATH}' is not executable")
-        else
-            local recorded_cli_sha actual_cli_sha
-            recorded_cli_sha="$(python3 -B -c "
+        local cli_meta_shas recorded_cli_sha recorded_edge_sha
+        cli_meta_shas="$(python3 -B -c "
 import json, sys
+cli_s = ''
+edge_s = ''
 with open(sys.argv[1], 'r') as f:
     for line in f:
         line = line.strip()
@@ -405,14 +402,40 @@ with open(sys.argv[1], 'r') as f:
         try:
             d = json.loads(line)
             if d.get('mutation_id') == 'fetch_cli':
-                print(d.get('metadata', {}).get('installed_sha256', ''))
+                md = d.get('metadata', {})
+                if isinstance(md, dict):
+                    cli_s = str(md.get('installed_sha256', '') or '')
+                    edge_s = str(md.get('edge_sha256', '') or '')
         except Exception:
             pass
-" "${LEDGER_FILE}" 2>/dev/null || true)"
-            if [[ -n "${recorded_cli_sha}" ]]; then
-                actual_cli_sha="$(compute_sha256 "${CLI_INSTALL_PATH}")"
-                if [[ "${actual_cli_sha}" != "${recorded_cli_sha}" ]]; then
-                    DRIFTED_ITEMS+=("fetch_cli: Digest mismatch at '${CLI_INSTALL_PATH}' (expected ${recorded_cli_sha})")
+print(f'{cli_s}|{edge_s}')
+" "${LEDGER_FILE}" 2>/dev/null || echo "|")"
+        IFS='|' read -r recorded_cli_sha recorded_edge_sha <<< "${cli_meta_shas}"
+        if [[ ! -f "${CLI_INSTALL_PATH}" ]]; then
+            DRIFTED_ITEMS+=("fetch_cli: Missing executable at '${CLI_INSTALL_PATH}'")
+        elif [[ ! -x "${CLI_INSTALL_PATH}" ]]; then
+            DRIFTED_ITEMS+=("fetch_cli: Binary at '${CLI_INSTALL_PATH}' is not executable")
+        elif [[ -n "${recorded_cli_sha}" ]]; then
+            local actual_cli_sha
+            actual_cli_sha="$(compute_sha256 "${CLI_INSTALL_PATH}")"
+            if [[ "${actual_cli_sha}" != "${recorded_cli_sha}" ]]; then
+                DRIFTED_ITEMS+=("fetch_cli: Digest mismatch at '${CLI_INSTALL_PATH}' (expected ${recorded_cli_sha})")
+            fi
+        fi
+        if [[ "${CHOSEN_PROFILE}" == "direct" || -n "${recorded_edge_sha}" ]]; then
+            local edge_link="${SERVICE_STATE_DIR}/versions/current"
+            local edge_bin="${edge_link}/opskit-edge"
+            if [[ ! -L "${edge_link}" ]]; then
+                DRIFTED_ITEMS+=("fetch_cli: Missing versioned symlink '${edge_link}'")
+            elif [[ ! -f "${edge_bin}" ]]; then
+                DRIFTED_ITEMS+=("fetch_cli: Missing edge executable at '${edge_bin}'")
+            elif [[ ! -x "${edge_bin}" ]]; then
+                DRIFTED_ITEMS+=("fetch_cli: Edge binary at '${edge_bin}' is not executable")
+            elif [[ -n "${recorded_edge_sha}" ]]; then
+                local actual_edge_sha
+                actual_edge_sha="$(compute_sha256 "${edge_bin}")"
+                if [[ "${actual_edge_sha}" != "${recorded_edge_sha}" ]]; then
+                    DRIFTED_ITEMS+=("fetch_cli: Digest mismatch at '${edge_bin}' (expected ${recorded_edge_sha})")
                 fi
             fi
         fi

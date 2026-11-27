@@ -2784,9 +2784,11 @@ grep -q "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" "${svc}"
 grep -q "UMask=0027" "${svc}"
 ! grep -q "NonBlocking=true" "${svc}"
 
-# Verify versions/current is NOT created as a directory
+# Verify versions/current is an atomic symlink to the active version directory containing opskit-edge
 test -d /var/lib/opskit/versions
-test ! -d /var/lib/opskit/versions/current
+test -L /var/lib/opskit/versions/current
+test -x /var/lib/opskit/versions/current/opskit-edge
+test "$(stat -c "%a:%U:%G" /var/lib/opskit/versions/current/opskit-edge)" = "755:opskit:opskit"
 
 # Verify unit SHA-256 fingerprints recorded in apply.jsonl
 grep "\"mutation_id\":\"edge_system_unit\"" /var/lib/opskit-bootstrap/apply.jsonl | grep -q "\"after_fingerprint\":\"sha256:"
@@ -2841,8 +2843,85 @@ echo "PASS: Repair detected unit permission drift and unexpected systemd .d/ dro
 '
 }
 
+# Test 47: Inaccessible root-only cwd in run_as_service_user + versioned opskit-edge installation/repair/undo
+test_inaccessible_cwd_and_versioned_edge_install() {
+    echo "--- Test 47: Inaccessible cwd execution and versioned opskit-edge install ---"
+    podman run --rm --privileged -v "${REPO_ROOT}:/bootstrap:ro" -v "${TEST_ARTIFACTS_DIR}:/artifacts:ro" localhost/opskit-test-debian:13 /bin/bash -c '
+set -euo pipefail
+export OPSKIT_TEST_MODE="1"
+export MOCK_KERNEL_RELEASE="6.1.0-28-amd64"
+export MOCK_DISK_FREE_GB="50"
+export OPSKIT_SKIP_DISK_CHECK="1"
+export OPSKIT_ARTIFACT_SOURCE_DIR="/artifacts"
+export OPSKIT_RELEASE_PUBKEY="/artifacts/release.pub"
+export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
+
+mkdir -p /root/opskit-inaccessible-cwd
+chmod 0700 /root/opskit-inaccessible-cwd
+cd /root/opskit-inaccessible-cwd
+
+# Full direct bootstrap invoked from a root-only 0700 directory
+/bootstrap/bin/opskit-bootstrap --profile direct --no-probe --yes >/dev/null
+
+# 1. Verify run_as_service_user handles inaccessible cwd cleanly across both runuser and python setuid paths
+(
+    LIB_DIR="/bootstrap/lib"
+    source "${LIB_DIR}/common.sh"
+    cwd_out="$(run_as_service_user "pwd")"
+    test "${cwd_out}" != "/root/opskit-inaccessible-cwd"
+    rootless_out="$(run_as_service_user "podman info --format \"{{.Host.Security.Rootless}}\"" 2>&1 || true)"
+    ! echo "${rootless_out}" | grep -qi "Permission denied"
+
+    # Exercise python setuid fallback branch with runuser hidden on PATH
+    mkdir -p /tmp/no-runuser-bin
+    for b in /usr/bin/* /bin/*; do
+        bn="$(basename "${b}")"
+        [ "${bn}" = "runuser" ] && continue
+        ln -sf "${b}" "/tmp/no-runuser-bin/${bn}"
+    done
+    py_cwd="$(PATH="/tmp/no-runuser-bin" run_as_service_user "pwd")"
+    test "${py_cwd}" != "/root/opskit-inaccessible-cwd"
+    rm -rf /tmp/no-runuser-bin
+)
+
+# 2. Verify /var/lib/opskit/versions/current/opskit-edge layout, ownership, and ledger metadata
+test -L /var/lib/opskit/versions/current
+test "$(readlink /var/lib/opskit/versions/current)" = "0.1.0"
+edge_bin="/var/lib/opskit/versions/current/opskit-edge"
+test -x "${edge_bin}"
+test "$(stat -c "%a:%U:%G" /var/lib/opskit/versions/0.1.0/opskit-edge)" = "755:opskit:opskit"
+test "$("${edge_bin}" --version)" = "opskit-edge 0.1.0 mock test"
+arch="$(uname -m)"
+expected_edge_sha="$(sha256sum "/artifacts/opskit-edge-linux-${arch}" | awk "{print \$1}")"
+actual_edge_sha="$(sha256sum "${edge_bin}" | awk "{print \$1}")"
+test "${actual_edge_sha}" = "${expected_edge_sha}"
+grep "\"mutation_id\":\"fetch_cli\"" /var/lib/opskit-bootstrap/apply.jsonl | grep -q "\"edge_sha256\":\"${expected_edge_sha}\""
+grep "\"mutation_id\":\"fetch_cli\"" /var/lib/opskit-bootstrap/apply.jsonl | grep -q "\"edge_version\":\"0.1.0\""
+
+# 3. Verify --repair detects tampered edge binary and restores it cleanly
+printf "#!/bin/sh\necho BAD\n" > /var/lib/opskit/versions/0.1.0/opskit-edge
+set +e
+repair_check="$(/bootstrap/bin/opskit-bootstrap --repair 2>&1)"
+repair_rc=$?
+set -e
+test "${repair_rc}" -eq 5
+echo "${repair_check}" | grep -q "fetch_cli: Digest mismatch at .*versions/current/opskit-edge"
+/bootstrap/bin/opskit-bootstrap --repair --yes >/dev/null
+test "$(sha256sum "${edge_bin}" | awk "{print \$1}")" = "${expected_edge_sha}"
+
+# 4. Verify plain --undo removes versioned edge symlink and binary, and --purge cleans everything
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --yes >/dev/null
+test ! -e /var/lib/opskit/versions/current
+test ! -e /var/lib/opskit/versions/0.1.0/opskit-edge
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
+test ! -d /var/lib/opskit
+echo "PASS: Inaccessible cwd execution and versioned opskit-edge lifecycle verified."
+'
+}
+
 test_user_home_symlink_privesc_defense
 test_port80_conflict_no_http_and_unit_hardening
 test_repair_detects_unit_perms_and_dropins
+test_inaccessible_cwd_and_versioned_edge_install
 
 echo "ALL OS MATRIX ACCEPTANCE TESTS PASSED."

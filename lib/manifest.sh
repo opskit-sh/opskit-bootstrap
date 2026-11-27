@@ -54,6 +54,18 @@ get_expected_key_id() {
 CLI_MUTATION_METADATA=""
 CLI_MUTATION_AFTER_FP=""
 CLI_MUTATION_BEFORE_FP=""
+_MANIFEST_VERSION=""
+_ART_SHA=""
+_ART_SIZE=""
+_ART_FILENAME=""
+_EDGE_ART_PRESENT="false"
+_EDGE_ART_SHA=""
+_EDGE_ART_SIZE=""
+_EDGE_ART_FILENAME=""
+_EDGE_INSTALLED_VERSION=""
+_EDGE_INSTALLED_PATH=""
+_EDGE_CURRENT_LINK=""
+_EDGE_INSTALLED_SHA=""
 
 canonicalize_manifest() {
     local src="$1"
@@ -206,22 +218,35 @@ print('OK')
     fi
 }
 
-# Parse and validate arch-specific artifact entry into _ART_SHA, _ART_SIZE, _ART_FILENAME.
+# Parse and validate manifest version and arch-specific artifacts into
+# _MANIFEST_VERSION, _ART_*, and _EDGE_ART_*.
 _extract_manifest_artifact() {
     local manifest_path="$1"
     local host_arch="$2"
     local cleanup_dir="${3:-}"
     local artifact_key="opskit-linux-${host_arch}"
+    local edge_key="opskit-edge-linux-${host_arch}"
+
+    _MANIFEST_VERSION=""
+    _ART_SHA=""
+    _ART_SIZE=""
+    _ART_FILENAME=""
+    _EDGE_ART_PRESENT="false"
+    _EDGE_ART_SHA=""
+    _EDGE_ART_SIZE=""
+    _EDGE_ART_FILENAME=""
 
     local preflight_info
     preflight_info="$(python3 -B -c "
-import json, sys
-sys.path.insert(0, sys.argv[3])
+import sys
+sys.path.insert(0, sys.argv[4])
 from canonicalize import loads_strict
 with open(sys.argv[1], 'r', encoding='utf-8') as f:
     d = loads_strict(f.read())
+ver = str(d.get('version', '') or '')
 arts = d.get('artifacts', {})
 k = sys.argv[2]
+ek = sys.argv[3]
 if not isinstance(arts, dict) or k not in arts or not isinstance(arts[k], dict):
     print('missing')
     sys.exit(0)
@@ -229,18 +254,37 @@ art = arts[k]
 sha = str(art.get('sha256', '') or '')
 sz = art.get('size', '')
 fn = str(art.get('filename', k) or k)
-if any(c in fn for c in ('|', '\n', '\r')) or any(c in sha for c in ('|', '\n', '\r')):
+if any(c in fn for c in ('|', '\n', '\r')) or any(c in sha for c in ('|', '\n', '\r')) or any(c in ver for c in ('|', '\n', '\r')):
     print('invalid')
     sys.exit(0)
-print(f'ok|{sha}|{sz}|{fn}')
-" "${manifest_path}" "${artifact_key}" "${LIB_DIR}" 2>/dev/null || echo "missing")"
+ep = 'false'
+esha = ''
+esz = ''
+efn = ''
+if ek in arts:
+    if not isinstance(arts[ek], dict):
+        print('invalid_edge')
+        sys.exit(0)
+    ep = 'true'
+    eart = arts[ek]
+    esha = str(eart.get('sha256', '') or '')
+    esz = eart.get('size', '')
+    efn = str(eart.get('filename', ek) or ek)
+    if any(c in efn for c in ('|', '\n', '\r')) or any(c in esha for c in ('|', '\n', '\r')):
+        print('invalid_edge')
+        sys.exit(0)
+print(f'ok|{ver}|{sha}|{sz}|{fn}|{ep}|{esha}|{esz}|{efn}')
+" "${manifest_path}" "${artifact_key}" "${edge_key}" "${LIB_DIR}" 2>/dev/null || echo "missing")"
 
-    if [[ "${preflight_info}" == "missing" || "${preflight_info}" != ok\|* ]]; then
+    if [[ "${preflight_info}" == "missing" || "${preflight_info}" == "invalid_edge" || "${preflight_info}" != ok\|* ]]; then
         [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+        if [[ "${preflight_info}" == "invalid_edge" ]]; then
+            die "${EXIT_VALIDATION_ERROR}" "Release manifest declares malformed edge artifact entry '${edge_key}'."
+        fi
         die "${EXIT_VALIDATION_ERROR}" "Release manifest does not declare artifact for host architecture '${host_arch}'."
     fi
 
-    IFS='|' read -r _ _ART_SHA _ART_SIZE _ART_FILENAME <<< "${preflight_info}"
+    IFS='|' read -r _ _MANIFEST_VERSION _ART_SHA _ART_SIZE _ART_FILENAME _EDGE_ART_PRESENT _EDGE_ART_SHA _EDGE_ART_SIZE _EDGE_ART_FILENAME <<< "${preflight_info}"
     if [[ -z "${_ART_SHA}" ]]; then
         [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
         die "${EXIT_VALIDATION_ERROR}" "Release manifest artifact '${artifact_key}' is missing sha256 digest."
@@ -253,9 +297,41 @@ print(f'ok|{sha}|{sz}|{fn}')
         [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
         die "${EXIT_VALIDATION_ERROR}" "Invalid artifact filename '${_ART_FILENAME}' in release manifest."
     fi
+
+    if [[ "${CHOSEN_PROFILE:-}" == "direct" && "${_EDGE_ART_PRESENT}" != "true" ]]; then
+        [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+        die "${EXIT_VALIDATION_ERROR}" "Release manifest does not declare edge artifact '${edge_key}' for host architecture '${host_arch}' required by direct profile."
+    fi
+
+    if [[ "${_EDGE_ART_PRESENT}" == "true" ]]; then
+        if [[ -z "${_MANIFEST_VERSION}" || "${_MANIFEST_VERSION}" == *".."* || "${_MANIFEST_VERSION}" == "current" || ! "${_MANIFEST_VERSION}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+            [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+            die "${EXIT_VALIDATION_ERROR}" "Release manifest declares invalid or missing version '${_MANIFEST_VERSION}'."
+        fi
+        if [[ -z "${_EDGE_ART_SHA}" ]]; then
+            [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+            die "${EXIT_VALIDATION_ERROR}" "Release manifest edge artifact '${edge_key}' is missing sha256 digest."
+        fi
+        if [[ ! "${_EDGE_ART_SIZE}" =~ ^[0-9]+$ || "${_EDGE_ART_SIZE}" -le 0 ]]; then
+            [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+            die "${EXIT_VALIDATION_ERROR}" "Release manifest edge artifact '${edge_key}' declares invalid or non-positive size '${_EDGE_ART_SIZE}'."
+        fi
+        if [[ -z "${_EDGE_ART_FILENAME}" || "${_EDGE_ART_FILENAME}" == *".."* || ! "${_EDGE_ART_FILENAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+            die "${EXIT_VALIDATION_ERROR}" "Invalid edge artifact filename '${_EDGE_ART_FILENAME}' in release manifest."
+        fi
+    fi
 }
 
 verify_and_install_cli() {
+    CLI_MUTATION_METADATA=""
+    CLI_MUTATION_AFTER_FP=""
+    CLI_MUTATION_BEFORE_FP=""
+    _EDGE_INSTALLED_VERSION=""
+    _EDGE_INSTALLED_PATH=""
+    _EDGE_CURRENT_LINK=""
+    _EDGE_INSTALLED_SHA=""
+
     local manifest_source="${OPSKIT_MANIFEST_URL:-}"
     local artifact_source_dir="${OPSKIT_ARTIFACT_SOURCE_DIR:-}"
     local pubkey_path
@@ -323,6 +399,26 @@ verify_local_manifest_preflight() {
     if [[ "${actual_size}" -ne "${_ART_SIZE}" ]]; then
         die "${EXIT_VALIDATION_ERROR}" "Artifact '${_ART_FILENAME}' size mismatch (expected ${_ART_SIZE}, got ${actual_size})."
     fi
+
+    if [[ "${CHOSEN_PROFILE:-}" == "direct" ]] || { [[ "${_EDGE_ART_PRESENT}" == "true" && -n "${CHOSEN_PROFILE:-}" ]]; }; then
+        local edge_key="opskit-edge-linux-${host_arch}"
+        local edge_path="${base_dir}/${_EDGE_ART_FILENAME}"
+        if [[ ! -f "${edge_path}" ]]; then
+            edge_path="${base_dir}/${edge_key}"
+        fi
+        if [[ ! -f "${edge_path}" ]]; then
+            die "${EXIT_VALIDATION_ERROR}" "Edge artifact '${_EDGE_ART_FILENAME}' not found in source directory '${base_dir}'."
+        fi
+        local edge_actual_sha edge_actual_size
+        edge_actual_sha="$(compute_sha256 "${edge_path}")"
+        if [[ "${edge_actual_sha}" != "${_EDGE_ART_SHA}" ]]; then
+            die "${EXIT_VALIDATION_ERROR}" "Edge artifact '${_EDGE_ART_FILENAME}' digest mismatch (expected ${_EDGE_ART_SHA}, got ${edge_actual_sha}). Tampered binary rejected."
+        fi
+        edge_actual_size="$(wc -c < "${edge_path}" | tr -d '[:space:]')"
+        if [[ "${edge_actual_size}" -ne "${_EDGE_ART_SIZE}" ]]; then
+            die "${EXIT_VALIDATION_ERROR}" "Edge artifact '${_EDGE_ART_FILENAME}' size mismatch (expected ${_EDGE_ART_SIZE}, got ${edge_actual_size})."
+        fi
+    fi
 }
 
 _cli_originated_from_opskit() {
@@ -384,6 +480,9 @@ _prepare_cli_install_state() {
             else
                 _CLI_BEFORE_FP="present:${current_sha}"
             fi
+            _CLI_PRE_EXISTING="${backup_existing}"
+            _CLI_PREVIOUS_SHA="${current_sha}"
+            _CLI_INSTALLED_SHA="${expected_sha}"
             CLI_MUTATION_METADATA="{\"path\":\"$(json_escape "${CLI_INSTALL_PATH}")\",\"installed_sha256\":\"$(json_escape "${expected_sha}")\",\"pre_existing\":${backup_existing},\"backup_path\":\"$(json_escape "${_CLI_BACKUP_PATH}")\",\"previous_sha256\":\"$(json_escape "${current_sha}")\"}"
             CLI_MUTATION_AFTER_FP="present:digest-verified"
             CLI_MUTATION_BEFORE_FP="${_CLI_BEFORE_FP}"
@@ -420,6 +519,7 @@ _verify_staged_and_install_cli() {
     local expected_size="$3"
     local label_name="$4"
     local cleanup_dir="${5:-}"
+    local keep_dir_on_success="${6:-false}"
 
     local install_dir
     install_dir="$(dirname "${CLI_INSTALL_PATH}")"
@@ -456,9 +556,12 @@ _verify_staged_and_install_cli() {
         die "${EXIT_VALIDATION_ERROR}" "Artifact '${label_name}' size mismatch (expected ${expected_size}, got ${actual_size})."
     fi
 
+    _CLI_INSTALLED_SHA="${actual_sha}"
     if ! _prepare_cli_install_state "${expected_sha}"; then
         rm -f "${tmp_install}"
-        [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+        if [[ "${keep_dir_on_success}" != "true" && -n "${cleanup_dir}" ]]; then
+            rm -rf "${cleanup_dir}" 2>/dev/null || true
+        fi
         return 0
     fi
     CLI_MUTATION_BEFORE_FP="${_CLI_BEFORE_FP}"
@@ -469,11 +572,120 @@ _verify_staged_and_install_cli() {
         chown root:root "${tmp_install}"
     fi
     mv -f "${tmp_install}" "${CLI_INSTALL_PATH}"
-    [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+    if [[ "${keep_dir_on_success}" != "true" && -n "${cleanup_dir}" ]]; then
+        rm -rf "${cleanup_dir}" 2>/dev/null || true
+    fi
 
     CLI_MUTATION_METADATA="{\"path\":\"$(json_escape "${CLI_INSTALL_PATH}")\",\"installed_sha256\":\"$(json_escape "${actual_sha}")\",\"pre_existing\":${_CLI_PRE_EXISTING},\"backup_path\":\"$(json_escape "${_CLI_BACKUP_PATH}")\",\"previous_sha256\":\"$(json_escape "${_CLI_PREVIOUS_SHA}")\"}"
     CLI_MUTATION_AFTER_FP="installed:${CLI_INSTALL_PATH}"
     log_info "Installed static CLI to ${CLI_INSTALL_PATH} (mode 0755)."
+}
+
+# Stage edge binary into a root-owned 0600 file first, verify SHA-256 and byte length,
+# then write into SERVICE_USER-owned versions/<version>/opskit-edge and atomically swap
+# the versions/current symlink as SERVICE_USER (never following symlinks as root).
+_verify_staged_and_install_edge() {
+    local src_path="$1"
+    local expected_sha="$2"
+    local expected_size="$3"
+    local label_name="$4"
+    local cleanup_dir="${5:-}"
+
+    local tmp_stage
+    tmp_stage="$(mktemp)"
+    chmod 0600 "${tmp_stage}"
+    if [[ "${EUID}" -eq 0 ]]; then
+        chown root:root "${tmp_stage}"
+    fi
+
+    if ! cp "${src_path}" "${tmp_stage}"; then
+        rm -f "${tmp_stage}"
+        [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+        die "${EXIT_RUNTIME_ERROR}" "Failed to stage verified edge binary to '${tmp_stage}'."
+    fi
+
+    local actual_sha actual_size
+    actual_sha="$(compute_sha256 "${tmp_stage}")"
+    if [[ "${actual_sha}" != "${expected_sha}" ]]; then
+        rm -f "${tmp_stage}"
+        [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+        die "${EXIT_VALIDATION_ERROR}" "Edge artifact '${label_name}' digest mismatch (expected ${expected_sha}, got ${actual_sha}). Tampered binary rejected."
+    fi
+    actual_size="$(wc -c < "${tmp_stage}" | tr -d '[:space:]')"
+    if [[ "${actual_size}" -ne "${expected_size}" ]]; then
+        rm -f "${tmp_stage}"
+        [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+        die "${EXIT_VALIDATION_ERROR}" "Edge artifact '${label_name}' size mismatch (expected ${expected_size}, got ${actual_size})."
+    fi
+
+    ensure_safe_dir_no_symlink "${SERVICE_STATE_DIR}"
+    if [[ ! -d "${SERVICE_STATE_DIR}" ]]; then
+        mkdir -p "${SERVICE_STATE_DIR}"
+        chmod 0750 "${SERVICE_STATE_DIR}"
+        if [[ "${EUID}" -eq 0 ]] && id "${SERVICE_USER}" >/dev/null 2>&1; then
+            chown "${SERVICE_USER}:${SERVICE_GROUP}" "${SERVICE_STATE_DIR}"
+        fi
+    fi
+
+    local versions_dir="${SERVICE_STATE_DIR}/versions"
+    local ver_dir="${versions_dir}/${_MANIFEST_VERSION}"
+    local ver_bin="${ver_dir}/opskit-edge"
+    local current_link="${versions_dir}/current"
+
+    local already_ok=false
+    if [[ -L "${current_link}" && "$(readlink "${current_link}" 2>/dev/null || true)" == "${_MANIFEST_VERSION}" && -f "${ver_bin}" && -x "${ver_bin}" ]]; then
+        local existing_sha
+        existing_sha="$(compute_sha256 "${ver_bin}" 2>/dev/null || true)"
+        if [[ "${existing_sha}" == "${actual_sha}" ]]; then
+            already_ok=true
+        fi
+    fi
+
+    if ! ${already_ok}; then
+        if ! run_as_service_user '
+            set -eu
+            versions_dir="$1"
+            version="$2"
+            ver_dir="${versions_dir}/${version}"
+            mkdir -p "${versions_dir}" "${ver_dir}"
+            chmod 0750 "${versions_dir}" "${ver_dir}"
+            umask 077
+            tmp_bin="$(mktemp "${ver_dir}/.opskit-edge.XXXXXX")"
+            cat > "${tmp_bin}"
+            chmod 0755 "${tmp_bin}"
+            mv -f "${tmp_bin}" "${ver_dir}/opskit-edge"
+            if [ -d "${versions_dir}/current" ] && [ ! -L "${versions_dir}/current" ]; then
+                rmdir "${versions_dir}/current"
+            fi
+            tmp_link="${versions_dir}/.current.tmp.$$"
+            rm -f "${tmp_link}"
+            ln -s -- "${version}" "${tmp_link}"
+            mv -Tf "${tmp_link}" "${versions_dir}/current"
+        ' "${versions_dir}" "${_MANIFEST_VERSION}" < "${tmp_stage}"; then
+            rm -f "${tmp_stage}"
+            [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+            die "${EXIT_RUNTIME_ERROR}" "Failed to install versioned opskit-edge binary into '${ver_bin}'."
+        fi
+        log_info "Edge artifact digest verified (${actual_sha}). Installed to ${ver_bin} (symlink ${current_link} -> ${_MANIFEST_VERSION})."
+    else
+        log_info "Edge binary at ${current_link}/opskit-edge already matches verified release digest (${actual_sha})."
+    fi
+
+    rm -f "${tmp_stage}"
+    [[ -n "${cleanup_dir}" ]] && rm -rf "${cleanup_dir}" 2>/dev/null || true
+
+    _EDGE_INSTALLED_VERSION="${_MANIFEST_VERSION}"
+    _EDGE_INSTALLED_PATH="${ver_bin}"
+    _EDGE_CURRENT_LINK="${current_link}"
+    _EDGE_INSTALLED_SHA="${actual_sha}"
+}
+
+_finalize_fetch_cli_metadata() {
+    local edge_fields=""
+    if [[ -n "${_EDGE_INSTALLED_SHA:-}" ]]; then
+        edge_fields=",\"edge_version\":\"$(json_escape "${_EDGE_INSTALLED_VERSION}")\",\"edge_path\":\"$(json_escape "${_EDGE_INSTALLED_PATH}")\",\"edge_current_link\":\"$(json_escape "${_EDGE_CURRENT_LINK}")\",\"edge_sha256\":\"$(json_escape "${_EDGE_INSTALLED_SHA}")\""
+    fi
+    CLI_MUTATION_METADATA="{\"path\":\"$(json_escape "${CLI_INSTALL_PATH}")\",\"installed_sha256\":\"$(json_escape "${_CLI_INSTALLED_SHA}")\",\"pre_existing\":${_CLI_PRE_EXISTING},\"backup_path\":\"$(json_escape "${_CLI_BACKUP_PATH}")\",\"previous_sha256\":\"$(json_escape "${_CLI_PREVIOUS_SHA}")\"${edge_fields}}"
 }
 
 verify_local_manifest_and_install() {
@@ -499,6 +711,19 @@ verify_local_manifest_and_install() {
     fi
 
     _verify_staged_and_install_cli "${artifact_path}" "${_ART_SHA}" "${_ART_SIZE}" "${_ART_FILENAME}"
+
+    if [[ "${CHOSEN_PROFILE:-}" == "direct" ]] || { [[ "${_EDGE_ART_PRESENT}" == "true" && -n "${CHOSEN_PROFILE:-}" ]] && id "${SERVICE_USER}" >/dev/null 2>&1; }; then
+        local edge_key="opskit-edge-linux-${host_arch}"
+        local edge_path="${base_dir}/${_EDGE_ART_FILENAME}"
+        if [[ ! -f "${edge_path}" ]]; then
+            edge_path="${base_dir}/${edge_key}"
+        fi
+        if [[ ! -f "${edge_path}" ]]; then
+            die "${EXIT_VALIDATION_ERROR}" "Edge artifact '${_EDGE_ART_FILENAME}' not found in source directory."
+        fi
+        _verify_staged_and_install_edge "${edge_path}" "${_EDGE_ART_SHA}" "${_EDGE_ART_SIZE}" "${_EDGE_ART_FILENAME}"
+        _finalize_fetch_cli_metadata
+    fi
 }
 
 download_and_verify_manifest() {
@@ -534,6 +759,11 @@ download_and_verify_manifest() {
     host_arch="$(uname -m)"
     _extract_manifest_artifact "${tmp_dir}/release-manifest.json" "${host_arch}" "${tmp_dir}"
 
+    local install_edge=false
+    if [[ "${CHOSEN_PROFILE:-}" == "direct" ]] || { [[ "${_EDGE_ART_PRESENT}" == "true" && -n "${CHOSEN_PROFILE:-}" ]] && id "${SERVICE_USER}" >/dev/null 2>&1; }; then
+        install_edge=true
+    fi
+
     local base_url artifact_url
     base_url="$(dirname "${url}")"
     artifact_url="${base_url}/${_ART_FILENAME}"
@@ -551,5 +781,24 @@ download_and_verify_manifest() {
         die "${EXIT_NETWORK_ERROR}" "Failed to download release payload from ${artifact_url}. Check network connectivity, proxy settings, or custom CA bundle."
     }
 
-    _verify_staged_and_install_cli "${tmp_dir}/payload.bin" "${_ART_SHA}" "${_ART_SIZE}" "${_ART_FILENAME}" "${tmp_dir}"
+    local keep_tmp="false"
+    ${install_edge} && keep_tmp="true"
+    _verify_staged_and_install_cli "${tmp_dir}/payload.bin" "${_ART_SHA}" "${_ART_SIZE}" "${_ART_FILENAME}" "${tmp_dir}" "${keep_tmp}"
+
+    if ${install_edge}; then
+        local edge_url="${base_url}/${_EDGE_ART_FILENAME}"
+        validate_remote_url "${edge_url}" "edge artifact URL"
+        log_info "Downloading edge release payload from ${edge_url}..."
+        set_curl_proto_flags "${edge_url}"
+        local edge_curl_flags=(-s -S --fail --max-time 120 "${CURL_PROTO_FLAGS[@]}" --max-filesize 268435456)
+        [[ -n "${FLAG_PROXY:-}" ]] && edge_curl_flags+=(--proxy "${FLAG_PROXY}")
+        [[ -n "${FLAG_CACERT:-}" ]] && edge_curl_flags+=(--cacert "${FLAG_CACERT}")
+
+        curl "${edge_curl_flags[@]}" -o "${tmp_dir}/edge-payload.bin" "${edge_url}" || {
+            rm -rf "${tmp_dir}"
+            die "${EXIT_NETWORK_ERROR}" "Failed to download edge release payload from ${edge_url}. Check network connectivity, proxy settings, or custom CA bundle."
+        }
+        _verify_staged_and_install_edge "${tmp_dir}/edge-payload.bin" "${_EDGE_ART_SHA}" "${_EDGE_ART_SIZE}" "${_EDGE_ART_FILENAME}" "${tmp_dir}"
+        _finalize_fetch_cli_metadata
+    fi
 }

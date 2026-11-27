@@ -85,7 +85,8 @@ local directory using the `--artifact-dir <path>` flag or the
 
 The directory must contain:
 - `release-manifest.json`: The signed `opskit.release-manifest/v1` document.
-- `opskit-linux-<arch>`: The static executable binary for the host architecture.
+- `opskit-linux-<arch>`: The static CLI executable binary for the host architecture.
+- `opskit-edge-linux-<arch>`: The edge executable binary for the host architecture (required for the `direct` profile, installed into `/var/lib/opskit/versions/<version>/opskit-edge` with `/var/lib/opskit/versions/current` symlinked to `<version>`).
 
 When provided, cryptographic verification (JCS canonicalization, Ed25519 signature
 check, and SHA-256 payload digest verification) executes identically to network

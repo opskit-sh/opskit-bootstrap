@@ -28,6 +28,20 @@ and digital signatures.
       "os": "linux",
       "sha256": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
       "size": 17892100
+    },
+    "opskit-edge-linux-x86_64": {
+      "filename": "opskit-edge-linux-x86_64",
+      "arch": "x86_64",
+      "os": "linux",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "size": 16210400
+    },
+    "opskit-edge-linux-aarch64": {
+      "filename": "opskit-edge-linux-aarch64",
+      "arch": "aarch64",
+      "os": "linux",
+      "sha256": "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752",
+      "size": 15984320
     }
   },
   "signatures": [
@@ -65,8 +79,12 @@ To verify a release manifest:
    destination directory before computing SHA-256 digest and byte length on that
    private copy (preventing source-directory TOCTOU races).
 5. **Atomic installation**: Only upon passing signature, digest, and size
-   checks is the staged file `chmod 0755` and atomically moved to its final
-   location (`/usr/local/bin/opskit`) owned by `root:root`.
+   checks is the CLI binary `chmod 0755` and atomically moved to its final
+   location (`/usr/local/bin/opskit`, owned by `root:root`). When the manifest
+   declares `opskit-edge-linux-<arch>` (required for the `direct` profile), it
+   is verified in the same manner and installed as the service user into
+   `/var/lib/opskit/versions/<version>/opskit-edge` (mode `0755`), with
+   `/var/lib/opskit/versions/current` atomically symlinked to `<version>`.
 
 If any verification step fails, the temporary file is deleted immediately,
 nothing is executed, and `opskit-bootstrap` exits with code `8` (`VALIDATION_ERROR`).

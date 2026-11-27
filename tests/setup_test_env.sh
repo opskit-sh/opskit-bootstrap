@@ -19,7 +19,7 @@ setup_test_artifacts() {
     openssl pkey -in "${temp_key}" -pubout -out "${target_dir}/release.pub" 2>/dev/null
 
     echo "test-release-key-1" > "${target_dir}/release.key_id"
-    cp "${fixture_dir}/opskit-linux-"* "${target_dir}/"
+    cp "${fixture_dir}/opskit-"* "${target_dir}/"
 
     # Canonicalize and sign manifest using ephemeral key
     local canon_file="${target_dir}/canon.tmp"

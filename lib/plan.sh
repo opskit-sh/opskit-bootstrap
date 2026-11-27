@@ -469,16 +469,17 @@ compile_plan() {
         fi
     fi
 
-    # Mutation 11: CLI binary installation (ledger-based reconciliation and pre-flight check)
+    # Mutation 11: CLI binary and versioned edge installation (ledger-based reconciliation and pre-flight check)
     local cli_needs_install=false
-    if [[ ! -f "${CLI_INSTALL_PATH}" || ! -x "${CLI_INSTALL_PATH}" ]]; then
-        cli_needs_install=true
-    elif ! is_mutation_recorded "fetch_cli"; then
-        cli_needs_install=true
-    elif [[ -f "${LEDGER_FILE}" ]]; then
-        local rec_cli_sha cur_cli_sha
-        rec_cli_sha="$(python3 -B -c "
+    local rec_cli_sha="" rec_edge_sha=""
+    local edge_current_link="${SERVICE_STATE_DIR}/versions/current"
+    local edge_current_bin="${edge_current_link}/opskit-edge"
+    if [[ -f "${LEDGER_FILE}" ]]; then
+        local cli_meta_shas
+        cli_meta_shas="$(python3 -B -c "
 import json, sys
+cli_s = ''
+edge_s = ''
 with open(sys.argv[1], 'r') as f:
     for line in f:
         line = line.strip()
@@ -486,13 +487,34 @@ with open(sys.argv[1], 'r') as f:
         try:
             d = json.loads(line)
             if d.get('mutation_id') == 'fetch_cli':
-                print(d.get('metadata', {}).get('installed_sha256', ''))
+                md = d.get('metadata', {})
+                if isinstance(md, dict):
+                    cli_s = str(md.get('installed_sha256', '') or '')
+                    edge_s = str(md.get('edge_sha256', '') or '')
         except Exception:
             pass
-" "${LEDGER_FILE}" 2>/dev/null || true)"
-        if [[ -n "${rec_cli_sha}" ]]; then
-            cur_cli_sha="$(compute_sha256 "${CLI_INSTALL_PATH}")"
-            if [[ "${cur_cli_sha}" != "${rec_cli_sha}" ]]; then
+print(f'{cli_s}|{edge_s}')
+" "${LEDGER_FILE}" 2>/dev/null || echo "|")"
+        IFS='|' read -r rec_cli_sha rec_edge_sha <<< "${cli_meta_shas}"
+    fi
+    if [[ ! -f "${CLI_INSTALL_PATH}" || ! -x "${CLI_INSTALL_PATH}" ]]; then
+        cli_needs_install=true
+    elif ! is_mutation_recorded "fetch_cli"; then
+        cli_needs_install=true
+    elif [[ -n "${rec_cli_sha}" ]]; then
+        local cur_cli_sha
+        cur_cli_sha="$(compute_sha256 "${CLI_INSTALL_PATH}")"
+        if [[ "${cur_cli_sha}" != "${rec_cli_sha}" ]]; then
+            cli_needs_install=true
+        fi
+    fi
+    if ! ${cli_needs_install} && [[ "${CHOSEN_PROFILE:-}" == "direct" || -n "${rec_edge_sha}" ]]; then
+        if [[ ! -L "${edge_current_link}" || ! -f "${edge_current_bin}" || ! -x "${edge_current_bin}" ]]; then
+            cli_needs_install=true
+        elif [[ -n "${rec_edge_sha}" ]]; then
+            local cur_edge_sha
+            cur_edge_sha="$(compute_sha256 "${edge_current_bin}")"
+            if [[ "${cur_edge_sha}" != "${rec_edge_sha}" ]]; then
                 cli_needs_install=true
             fi
         fi
@@ -505,11 +527,24 @@ with open(sys.argv[1], 'r') as f:
             source_manifest="${OPSKIT_ARTIFACT_SOURCE_DIR}/release-manifest.json"
         fi
         if [[ -n "${source_manifest}" ]]; then
-            local exp_sha cur_sha
-            exp_sha="$(python3 -B -c "import json, sys; d=json.load(open(sys.argv[1])); print(d.get('artifacts',{}).get('opskit-linux-' + sys.argv[2], {}).get('sha256',''))" "${source_manifest}" "$(uname -m)" 2>/dev/null || true)"
+            local exp_shas exp_sha exp_edge_sha cur_sha cur_edge_sha_src
+            exp_shas="$(python3 -B -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+arts = d.get('artifacts', {})
+cli_s = str(arts.get('opskit-linux-' + sys.argv[2], {}).get('sha256', '') or '')
+edge_s = str(arts.get('opskit-edge-linux-' + sys.argv[2], {}).get('sha256', '') or '')
+print(f'{cli_s}|{edge_s}')
+" "${source_manifest}" "$(uname -m)" 2>/dev/null || echo "|")"
+            IFS='|' read -r exp_sha exp_edge_sha <<< "${exp_shas}"
             cur_sha="$(compute_sha256 "${CLI_INSTALL_PATH}")"
             if [[ -n "${exp_sha}" && "${cur_sha}" != "${exp_sha}" ]]; then
                 cli_needs_install=true
+            elif [[ -n "${exp_edge_sha}" && -x "${edge_current_bin}" ]]; then
+                cur_edge_sha_src="$(compute_sha256 "${edge_current_bin}")"
+                if [[ "${cur_edge_sha_src}" != "${exp_edge_sha}" ]]; then
+                    cli_needs_install=true
+                fi
             fi
         fi
     fi

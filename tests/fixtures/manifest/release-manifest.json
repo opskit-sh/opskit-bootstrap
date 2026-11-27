@@ -16,6 +16,20 @@
       "os": "linux",
       "sha256": "2b1dc9e45262332e91b5697d029dfeb3e9943bb498fc692337fc6c52ef78892c",
       "size": 192
+    },
+    "opskit-edge-linux-x86_64": {
+      "filename": "opskit-edge-linux-x86_64",
+      "arch": "x86_64",
+      "os": "linux",
+      "sha256": "297454726aa3161d40633cdbf39b1bb6be1429c4cb69973b9974d75d958df1aa",
+      "size": 156
+    },
+    "opskit-edge-linux-aarch64": {
+      "filename": "opskit-edge-linux-aarch64",
+      "arch": "aarch64",
+      "os": "linux",
+      "sha256": "3d248b3a7635c7e6e8e9f75b5df7b61266ecc8376effa326ce2409f83102826d",
+      "size": 157
     }
   },
   "signatures": [

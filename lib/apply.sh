@@ -157,7 +157,15 @@ apply_mutations() {
         provision_rootless_docker
     fi
 
-    # 5. Direct profile: system edge unit FIRST, then socket units, then firewall rules
+    # 5a. Fetch verified CLI and versioned opskit-edge binary BEFORE unit/socket activation
+    if is_mutation_planned "fetch_cli"; then
+        verify_and_install_cli
+        local after_fp="${CLI_MUTATION_AFTER_FP:-installed:${CLI_INSTALL_PATH}}"
+        local before_fp="${CLI_MUTATION_BEFORE_FP:-absent}"
+        record_mutation "fetch_cli" "H" "${before_fp}" "${after_fp}" "${PLAN_HASH}" "${CLI_MUTATION_METADATA}"
+    fi
+
+    # 5b. Direct profile: system edge unit FIRST, then socket units, then firewall rules
     if [[ "${CHOSEN_PROFILE}" == "direct" ]]; then
         is_mutation_planned "edge_system_unit" && install_edge_system_unit
         is_mutation_planned "edge_socket_units" && install_edge_socket_units
@@ -177,14 +185,6 @@ apply_mutations() {
     # 10. Security labels
     if is_mutation_planned "security_labels"; then
         apply_security_labels
-    fi
-
-    # 11. Fetch CLI binary via signed manifest
-    if is_mutation_planned "fetch_cli"; then
-        verify_and_install_cli
-        local after_fp="${CLI_MUTATION_AFTER_FP:-installed:${CLI_INSTALL_PATH}}"
-        local before_fp="${CLI_MUTATION_BEFORE_FP:-absent}"
-        record_mutation "fetch_cli" "H" "${before_fp}" "${after_fp}" "${PLAN_HASH}" "${CLI_MUTATION_METADATA}"
     fi
 
     # 12. Fail-closed runtime and cgroup delegation verification
