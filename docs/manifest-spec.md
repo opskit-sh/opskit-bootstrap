@@ -44,23 +44,29 @@ and digital signatures.
 
 To verify a release manifest:
 
-1. **Canonicalization**: The manifest body is stripped of the `signatures`
-   array. The remaining document is canonicalized using a JCS-compatible profile
-   for this schema; numbers restricted to integers using Python 3:
-   `json.dumps(manifest_without_signatures, separators=(',', ':'), sort_keys=True, ensure_ascii=False).encode('utf-8')`.
-2. **Signature verification**: The raw canonical bytes are verified against
-   the Ed25519 signature using the pinned release public key (`opskit-release-2026`
-   committed in `keys/release.pub` and vendored in `lib/release.pub`) via OpenSSL:
+1. **Schema & Canonicalization**: The manifest `schema` must equal
+   `opskit.release-manifest/v1`. Strict JSON parsing rejects duplicate object
+   keys and non-finite numeric constants (RFC 8785). The manifest body is
+   stripped of the `signatures` array and serialized via Python 3:
+   `json.dumps(manifest_without_signatures, separators=(',', ':'), sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8')`.
+2. **Signature verification**: Among `signatures` entries with `algorithm == "ed25519"`,
+   the verifier selects the entry matching the pinned `key_id` (`opskit-release-2026`,
+   supporting multi-signature key rotation) and verifies the raw canonical bytes
+   against the pinned release public key (`keys/release.pub` / `lib/release.pub`,
+   whose SHA-256 digest is pinned in production) via OpenSSL:
    `openssl pkeyutl -verify -pubin -inkey <pubkey> -rawin -in <canonical_bytes> -sigfile <signature_bytes>`.
-3. **Artifact selection**: The host architecture (`uname -m`) selects the
-   corresponding artifact entry from `artifacts`.
-4. **Digest verification**: The downloaded artifact is placed into an
-   isolated temporary file and its SHA-256 digest is computed. The digest
-   must match the `sha256` field in the manifest exactly.
-5. **Size validation**: The byte length of the file must match the `size` field.
-6. **Atomic installation**: Only upon passing signature, digest, and size
-   checks is the artifact moved to its final location (`/usr/local/bin/opskit`)
-   with file mode `0755` owned by `root:root`.
+3. **Artifact selection & filename safety**: The host architecture (`uname -m`)
+   selects the corresponding artifact entry from `artifacts`. Declared `filename`
+   values must match `^[A-Za-z0-9][A-Za-z0-9._-]*$` with no `..` traversal.
+4. **Transport & Staged Digest/Size Verification**: Remote downloads require
+   `https://` with TLS 1.2+, no redirects (`curl --proto =https --proto-redir =https --tlsv1.2`),
+   and bounded `--max-filesize`. Remote payloads download to a fixed temporary file;
+   local and remote payloads are copied into a root-owned `0600` staging file in the
+   destination directory before computing SHA-256 digest and byte length on that
+   private copy (preventing source-directory TOCTOU races).
+5. **Atomic installation**: Only upon passing signature, digest, and size
+   checks is the staged file `chmod 0755` and atomically moved to its final
+   location (`/usr/local/bin/opskit`) owned by `root:root`.
 
 If any verification step fails, the temporary file is deleted immediately,
 nothing is executed, and `opskit-bootstrap` exits with code `8` (`VALIDATION_ERROR`).

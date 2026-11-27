@@ -43,27 +43,39 @@ The exposure boundary is governed by three distinct exposure profiles:
 
 | Profile | Ingress Mechanism | Privileged Artifacts |
 |---|---|---|
-| `direct` | Inbound TCP traffic directly to node on ports 443 and 80 | Root-owned socket units (`opskit-edge-443.socket`, `opskit-edge-80.socket`), root-owned service unit (`opskit-edge.service`, `User=opskit`), host firewall rule |
-| `tunnel` | Outbound encrypted overlay connection via cloudflared | Zero root-owned units beyond service account and systemd user linger |
-| `private` | Local Unix domain sockets or private LAN/VPN access | Zero root-owned units beyond service account and systemd user linger |
+| `direct` | Inbound TCP traffic directly to node on ports 443 (and optional 80 unless `--no-http`) | Root-owned socket units (`opskit-edge-443.socket`, optional `opskit-edge-80.socket`), hardened root-owned service unit (`opskit-edge.service`, `User=opskit`), conditional `user@.service` cgroup v2 delegation drop-in, host firewall rule |
+| `tunnel` | Outbound encrypted overlay connection via cloudflared | Zero root-owned exposure units beyond service account, systemd user linger, and conditional `user@.service` cgroup v2 delegation drop-in |
+| `private` | Local Unix domain sockets or private LAN/VPN access | Zero root-owned exposure units beyond service account, systemd user linger, and conditional `user@.service` cgroup v2 delegation drop-in |
 
 ### Socket activation under direct profile
 
-Under the `direct` profile, binding privileged port 443 and port 80 without
+Under the `direct` profile, binding privileged port 443 and optional port 80 without
 running a root daemon is achieved using systemd socket activation
 ([sd_listen_fds(3)](https://www.freedesktop.org/software/systemd/man/sd_listen_fds.html)):
 
 1. Systemd binds listening stream sockets for port 443 (`opskit-edge-443.socket`)
-   and port 80 (`opskit-edge-80.socket`) during system boot as root.
-2. When traffic arrives or when the service is started, systemd activates
-   `opskit-edge.service`.
-3. The service unit declares `User=opskit` and `Group=opskit` in accordance
-   with [systemd.exec(5)](https://www.freedesktop.org/software/systemd/man/systemd.exec.html).
+   and, unless `--no-http` is passed, port 80 (`opskit-edge-80.socket`) during
+   system boot as root. Dual-stack sockets use `BindIPv6Only=ipv6-only`
+   ([ipv6(7)](https://man7.org/linux/man-pages/man7/ipv6.7.html)) when IPv6 is
+   enabled on the host kernel, and set `NonBlocking=true` in `[Socket]`
+   ([systemd.socket(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html)).
+2. The hardened system service unit `opskit-edge.service` is written before
+   activating the socket units and declares `Requires=` and `After=` for the
+   active socket unit(s).
+3. The service unit declares `User=opskit`, `Group=opskit`, `UMask=0027`,
+   `NoNewPrivileges=yes`, empty capability sets, `ProtectSystem=strict`,
+   `ReadWritePaths=/var/lib/opskit`, `ProtectHome=yes`, `PrivateTmp=yes`,
+   `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, and `RestrictNamespaces=yes`
+   in accordance with [systemd.exec(5)](https://www.freedesktop.org/software/systemd/man/systemd.exec.html).
 4. Systemd drops all root capabilities and passes the open file descriptors
    starting at descriptor index 3 to the unprivileged process.
 5. `opskit-edge` receives the file descriptors, verifies they are stream
    sockets via `SO_TYPE` and `SO_ACCEPTCONN`, classifies descriptors named `443`
    as TLS listeners, and begins serving traffic unprivileged.
+
+User-scope exposure units (`opskit-edge.service`, and `cloudflared.service` under
+`tunnel`) are provisioned for non-`direct` profiles; `opskit-cloud.service` is
+installed separately during control-plane enrollment (`opskit cloud connect`).
 
 ## 3. Host integration and distribution family modules
 
@@ -92,8 +104,9 @@ distribution family modules:
       and no custom chains, sets, maps, or flowtables, both the `input` chain and table are deleted; if any foreign or untagged
       rule or non-rule object (such as a custom chain, set, map, or flowtable) remains inside `inet opskit`, OpsKit preserves the table, emits a single
       warning per run naming it, and allows profile transitions to proceed unless a colliding `opskit-*` comment remains in the chain.
-    - Under `firewalld`, evaluates and manages permanent service and port rules via `firewall-cmd`, recording `pre_existing: true` when a port was already allowed so uninstallation and profile transitions preserve administrator-owned rules; removal removes permanent rules regardless of whether `firewalld` is currently active.
-    - Under `ufw`, records `pre_existing: true` if an administrator rule already allows the port, otherwise adds rules tagged with `comment "opskit-443"` / `comment "opskit-80"` and removes only matching tagged rules regardless of whether `ufw` is currently active or disabled.
+    - Under `firewalld` (across all distribution families when active), evaluates and manages both runtime and permanent port rules via `firewall-cmd` without `--reload`, recording `pre_existing: true` when a port was already allowed in both runtime and permanent configuration so uninstallation and profile transitions preserve administrator-owned rules; removal deletes both runtime and permanent rules (or offline rules when `firewalld` is inactive).
+    - Under `ufw` (across all distribution families when active), records `pre_existing: true` only when an administrator rule already allows `Anywhere`, otherwise adds rules tagged with `comment "opskit-443"` / `comment "opskit-80"` and removes only matching tagged rule numbers (or staged rules when `ufw` is disabled).
+    - Under `iptables`, pairs IPv6 rules via `ip6tables` when IPv6 is enabled on the host.
 
 This design preserves byte-stable planning and identical command-line flags
 across all platforms while respecting the native administration toolchains

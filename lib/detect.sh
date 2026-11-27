@@ -4,21 +4,20 @@ set -euo pipefail
 
 # Sourced by opskit-bootstrap; assumes common.sh is loaded
 
-detect_capabilities() {
+# Minimal OS-family + Python 3 discovery used by offline --undo without running pre-bootstrap gates.
+detect_os_family() {
     validate_test_hooks
     local os_release_file="${OPSKIT_OS_RELEASE_FILE:-/etc/os-release}"
     if [[ ! -f "${os_release_file}" ]]; then
         die "${EXIT_VALIDATION_ERROR}" "Cannot identify host operating system: '${os_release_file}' not found."
     fi
 
-    # Read distribution metadata
     OS_ID=""
     OS_NAME=""
     OS_VERSION_ID=""
     OS_VERSION=""
     ID_LIKE=""
 
-    # Source os-release in a subshell or parse key=value lines
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
         key="$(echo "${key}" | tr -d '[:space:]')"
         value="${value%\"}"
@@ -32,58 +31,18 @@ detect_capabilities() {
         esac
     done < "${os_release_file}"
 
-    # Determine distribution family and enforce version gates
     DETECTED_FAMILY=""
     case "${OS_ID}" in
-        debian)
+        debian|ubuntu)
             DETECTED_FAMILY="debian"
-            local major_version="${OS_VERSION_ID%%.*}"
-            if [[ -z "${major_version}" ]] || [[ "${major_version}" -lt 13 ]]; then
-                die "${EXIT_VALIDATION_ERROR}" "Debian 13 (trixie) or higher required; found Debian ${OS_VERSION_ID:-unknown}. Upgrade to Debian 13 using 'apt-get dist-upgrade'."
-            fi
             ;;
-        ubuntu)
-            DETECTED_FAMILY="debian"
-            local major_version="${OS_VERSION_ID%%.*}"
-            if [[ -z "${major_version}" ]] || ! [[ "${major_version}" =~ ^[0-9]+$ ]] || [[ "${major_version}" -lt 24 ]]; then
-                die "${EXIT_VALIDATION_ERROR}" "Ubuntu 24.04 LTS (noble) or higher required; found Ubuntu ${OS_VERSION_ID:-unknown}. Upgrade using 'do-release-upgrade'."
-            fi
-            ;;
-        rhel|centos|rocky|almalinux)
+        rhel|centos|rocky|almalinux|fedora)
             DETECTED_FAMILY="rhel"
-            local major_version="${OS_VERSION_ID%%.*}"
-            if [[ -z "${major_version}" ]] || [[ "${major_version}" -lt 9 ]]; then
-                die "${EXIT_VALIDATION_ERROR}" "Enterprise Linux 9 or higher required; found ${OS_NAME} ${OS_VERSION_ID:-unknown}. Upgrade using 'dnf system-upgrade'."
-            fi
             ;;
-        fedora)
-            DETECTED_FAMILY="rhel"
-            local major_version="${OS_VERSION_ID%%.*}"
-            if [[ -z "${major_version}" ]] || [[ "${major_version}" -lt 39 ]]; then
-                die "${EXIT_VALIDATION_ERROR}" "Fedora Server 39 or higher required; found Fedora ${OS_VERSION_ID:-unknown}. Upgrade using 'dnf system-upgrade'."
-            fi
-            ;;
-        sles|sled|sles_sap)
-            DETECTED_FAMILY="sles"
-            local major_version="${OS_VERSION_ID%%.*}"
-            local sp_version="${OS_VERSION_ID#*.}"
-            if [[ -z "${major_version}" ]] || [[ "${major_version}" -lt 15 ]] || [[ "${major_version}" -eq 15 && "${sp_version}" -lt 7 ]]; then
-                die "${EXIT_VALIDATION_ERROR}" "SUSE Linux Enterprise Server 15 SP7+ required; found ${OS_NAME} ${OS_VERSION_ID:-unknown}. Upgrade via YaST or 'zypper migration'."
-            fi
-            ;;
-        opensuse-leap)
-            DETECTED_FAMILY="sles"
-            local major_version="${OS_VERSION_ID%%.*}"
-            local minor_version="${OS_VERSION_ID#*.}"
-            if [[ -z "${major_version}" ]] || [[ "${major_version}" -lt 15 ]] || [[ "${major_version}" -eq 15 && "${minor_version}" -lt 6 ]]; then
-                die "${EXIT_VALIDATION_ERROR}" "openSUSE Leap 15.6+ required; found openSUSE Leap ${OS_VERSION_ID:-unknown}. Upgrade via 'zypper dup'."
-            fi
-            ;;
-        opensuse-tumbleweed)
+        sles|sled|sles_sap|opensuse-leap|opensuse-tumbleweed)
             DETECTED_FAMILY="sles"
             ;;
         *)
-            # Check ID_LIKE fallbacks
             if [[ "${ID_LIKE}" =~ (rhel|centos|fedora) ]]; then
                 DETECTED_FAMILY="rhel"
             elif [[ "${ID_LIKE}" =~ (suse|opensuse) ]]; then
@@ -96,7 +55,6 @@ detect_capabilities() {
             ;;
     esac
 
-    # Enforce Python 3 dependency
     if ! command -v python3 >/dev/null 2>&1; then
         local remedy=""
         case "${DETECTED_FAMILY}" in
@@ -107,6 +65,67 @@ detect_capabilities() {
         esac
         die "${EXIT_VALIDATION_ERROR}" "Python 3 is required for release manifest cryptographic verification and ledger validation. ${remedy}"
     fi
+}
+
+detect_capabilities() {
+    detect_os_family
+
+    # Enforce strict distribution ID and version gates (no un-gated ID_LIKE fallback).
+    case "${OS_ID}" in
+        debian)
+            local major_version="${OS_VERSION_ID%%.*}"
+            if [[ -z "${major_version}" ]] || ! [[ "${major_version}" =~ ^[0-9]+$ ]] || [[ "${major_version}" -lt 13 ]]; then
+                die "${EXIT_VALIDATION_ERROR}" "Debian 13 (trixie) or higher required; found Debian ${OS_VERSION_ID:-unknown}. Upgrade to Debian 13 using 'apt-get dist-upgrade'."
+            fi
+            ;;
+        ubuntu)
+            local major_version="${OS_VERSION_ID%%.*}"
+            if [[ -z "${major_version}" ]] || ! [[ "${major_version}" =~ ^[0-9]+$ ]] || [[ "${major_version}" -lt 24 ]]; then
+                die "${EXIT_VALIDATION_ERROR}" "Ubuntu 24.04 LTS (noble) or higher required; found Ubuntu ${OS_VERSION_ID:-unknown}. Upgrade using 'do-release-upgrade'."
+            fi
+            ;;
+        rhel|centos|rocky|almalinux)
+            local major_version="${OS_VERSION_ID%%.*}"
+            if [[ -z "${major_version}" ]] || ! [[ "${major_version}" =~ ^[0-9]+$ ]] || [[ "${major_version}" -lt 9 ]]; then
+                die "${EXIT_VALIDATION_ERROR}" "Enterprise Linux 9 or higher required; found ${OS_NAME} ${OS_VERSION_ID:-unknown}. Upgrade using 'dnf system-upgrade'."
+            fi
+            ;;
+        fedora)
+            local major_version="${OS_VERSION_ID%%.*}"
+            if [[ -z "${major_version}" ]] || ! [[ "${major_version}" =~ ^[0-9]+$ ]] || [[ "${major_version}" -lt 39 ]]; then
+                die "${EXIT_VALIDATION_ERROR}" "Fedora Server 39 or higher required; found Fedora ${OS_VERSION_ID:-unknown}. Upgrade using 'dnf system-upgrade'."
+            fi
+            ;;
+        sles|sled|sles_sap)
+            local major_version="${OS_VERSION_ID%%.*}"
+            local sp_version="0"
+            if [[ "${OS_VERSION_ID}" == *.* ]]; then
+                sp_version="${OS_VERSION_ID#*.}"
+                sp_version="${sp_version%%.*}"
+            fi
+            if [[ -z "${major_version}" ]] || ! [[ "${major_version}" =~ ^[0-9]+$ ]] || ! [[ "${sp_version}" =~ ^[0-9]+$ ]] \
+               || [[ "${major_version}" -lt 15 ]] || [[ "${major_version}" -eq 15 && "${sp_version}" -lt 7 ]]; then
+                die "${EXIT_VALIDATION_ERROR}" "SUSE Linux Enterprise Server 15 SP7+ required; found ${OS_NAME} ${OS_VERSION_ID:-unknown}. Upgrade via YaST or 'zypper migration'."
+            fi
+            ;;
+        opensuse-leap)
+            local major_version="${OS_VERSION_ID%%.*}"
+            local minor_version="0"
+            if [[ "${OS_VERSION_ID}" == *.* ]]; then
+                minor_version="${OS_VERSION_ID#*.}"
+                minor_version="${minor_version%%.*}"
+            fi
+            if [[ -z "${major_version}" ]] || ! [[ "${major_version}" =~ ^[0-9]+$ ]] || ! [[ "${minor_version}" =~ ^[0-9]+$ ]] \
+               || [[ "${major_version}" -lt 15 ]] || [[ "${major_version}" -eq 15 && "${minor_version}" -lt 6 ]]; then
+                die "${EXIT_VALIDATION_ERROR}" "openSUSE Leap 15.6+ required; found openSUSE Leap ${OS_VERSION_ID:-unknown}. Upgrade via 'zypper dup'."
+            fi
+            ;;
+        opensuse-tumbleweed)
+            ;;
+        *)
+            die "${EXIT_VALIDATION_ERROR}" "Unsupported distribution '${OS_ID}'. Supported distributions are Debian 13+, Ubuntu 24.04+, RHEL 9+, Fedora Server 39+, and SLES 15 SP7+."
+            ;;
+    esac
 
     # Linux kernel gate: >= 5.4
     # Upstream isolation floor (user namespaces + cgroups v2): https://man7.org/linux/man-pages/man7/user_namespaces.7.html
@@ -114,11 +133,12 @@ detect_capabilities() {
     local k_major k_minor
     k_major="$(echo "${KERNEL_RELEASE}" | cut -d. -f1)"
     k_minor="$(echo "${KERNEL_RELEASE}" | cut -d. -f2)"
-    if [[ "${k_major}" -lt 5 ]] || [[ "${k_major}" -eq 5 && "${k_minor}" -lt 4 ]]; then
+    k_minor="${k_minor%%[^0-9]*}"
+    if [[ ! "${k_major}" =~ ^[0-9]+$ || ! "${k_minor}" =~ ^[0-9]+$ ]] || [[ "${k_major}" -lt 5 ]] || [[ "${k_major}" -eq 5 && "${k_minor}" -lt 4 ]]; then
         die "${EXIT_VALIDATION_ERROR}" "Linux kernel 5.4 or higher required for rootless container isolation; found kernel ${KERNEL_RELEASE}."
     fi
 
-    # cgroups v2 check
+    # cgroups v2 check (unified hierarchy required; hybrid v1+v2 is rejected)
     # Upstream cgroups v2 hierarchy and resource controllers: https://docs.kernel.org/admin-guide/cgroup-v2.html
     CGROUPS_V2=false
     CGROUP_CONTROLLERS=()
@@ -130,16 +150,13 @@ detect_capabilities() {
         while IFS= read -r ctrl; do
             [[ -n "${ctrl}" ]] && CGROUP_CONTROLLERS+=("${ctrl}")
         done < <(tr ' ' '\n' < /sys/fs/cgroup/cgroup.controllers)
-    elif grep -q "cgroup2" /proc/mounts 2>/dev/null; then
-        CGROUPS_V2=true
-        CGROUP_CONTROLLERS=("cpu" "memory" "io" "pids")
-    elif [[ "${OPSKIT_TEST_MODE:-0}" == "1" ]] && [[ -n "${OPSKIT_FORCE_CGROUPS_V2:-}" ]]; then
+    elif [[ "${OPSKIT_TEST_HOOKS_COMPILED}" == "1" && "${OPSKIT_TEST_MODE:-0}" == "1" && -n "${OPSKIT_FORCE_CGROUPS_V2:-}" ]]; then
         CGROUPS_V2=true
         CGROUP_CONTROLLERS=("cpu" "memory" "io" "pids")
     fi
 
     if ! ${CGROUPS_V2}; then
-        die "${EXIT_VALIDATION_ERROR}" "cgroups v2 is required for rootless container resource isolation; cgroup2 mount not detected."
+        die "${EXIT_VALIDATION_ERROR}" "Unified cgroups v2 hierarchy (/sys/fs/cgroup/cgroup.controllers) is required for rootless container resource isolation."
     fi
 
     # systemd system manager verification
@@ -149,7 +166,6 @@ detect_capabilities() {
     elif [[ -n "${OPSKIT_FORCE_SYSTEMD:-}" ]]; then
         SYSTEMD_RUNNING=true
     else
-        # In container environments, check PID 1 or comm
         local p1_comm
         p1_comm="$(cat /proc/1/comm 2>/dev/null || true)"
         if [[ "${p1_comm}" =~ (systemd|init) ]]; then
@@ -203,7 +219,8 @@ detect_capabilities() {
             local p_major p_minor
             p_major="$(echo "${RUNTIME_VERSION}" | cut -d. -f1)"
             p_minor="$(echo "${RUNTIME_VERSION}" | cut -d. -f2)"
-            if [[ "${p_major}" -lt 4 ]] || [[ "${p_major}" -eq 4 && "${p_minor}" -lt 4 ]]; then
+            p_minor="${p_minor%%[^0-9]*}"
+            if [[ ! "${p_major}" =~ ^[0-9]+$ || ! "${p_minor}" =~ ^[0-9]+$ ]] || [[ "${p_major}" -lt 4 ]] || [[ "${p_major}" -eq 4 && "${p_minor}" -lt 4 ]]; then
                 die "${EXIT_VALIDATION_ERROR}" "Podman 4.4+ required for Quadlet; found Podman ${RUNTIME_VERSION}. Upgrade podman using your system package manager."
             fi
         else
@@ -269,15 +286,27 @@ detect_capabilities() {
         SUBUID_ALLOCATED=true
     fi
 
-    # Service user inspection
+    # Service user inspection (audit UID/GID != 0 and ban privileged groups)
     SERVICE_USER_EXISTS=false
     SERVICE_USER_IN_DOCKER=false
     if id "${SERVICE_USER}" >/dev/null 2>&1; then
         SERVICE_USER_EXISTS=true
-        # Audit docker group: BANNED by security model
-        if id -Gn "${SERVICE_USER}" 2>/dev/null | grep -qw "docker"; then
+        local svc_uid_chk svc_gid_chk svc_groups
+        svc_uid_chk="$(id -u "${SERVICE_USER}")"
+        svc_gid_chk="$(id -g "${SERVICE_USER}")"
+        if [[ "${svc_uid_chk}" -eq 0 || "${svc_gid_chk}" -eq 0 ]]; then
+            die "${EXIT_VALIDATION_ERROR}" "Service user '${SERVICE_USER}' must not have UID 0 or primary GID 0."
+        fi
+        svc_groups="$(id -Gn "${SERVICE_USER}" 2>/dev/null || true)"
+        if grep -qw "docker" <<< "${svc_groups}"; then
             die "${EXIT_VALIDATION_ERROR}" "Service user '${SERVICE_USER}' is in the 'docker' group. The docker group grants unconfined host access, violating the rootless security boundary. Remove the user from the docker group before bootstrapping."
         fi
+        local priv_grp
+        for priv_grp in sudo wheel root adm lxd libvirt disk shadow; do
+            if grep -qw "${priv_grp}" <<< "${svc_groups}"; then
+                die "${EXIT_VALIDATION_ERROR}" "Service user '${SERVICE_USER}' is a member of privileged group '${priv_grp}'. Remove this membership before bootstrapping."
+            fi
+        done
     fi
 
     # Systemd linger status
@@ -290,7 +319,7 @@ detect_capabilities() {
     # Upstream rootless Docker socket and SecurityOptions verification:
     # https://docs.docker.com/engine/security/rootless/
     if [[ "${DETECTED_RUNTIME}" == "docker" ]]; then
-        if [[ "${OPSKIT_TEST_MODE:-0}" == "1" && -n "${MOCK_DOCKER_ROOTLESS_USABLE:-}" ]]; then
+        if [[ "${OPSKIT_TEST_HOOKS_COMPILED}" == "1" && "${OPSKIT_TEST_MODE:-0}" == "1" && -n "${MOCK_DOCKER_ROOTLESS_USABLE:-}" ]]; then
             if [[ "${MOCK_DOCKER_ROOTLESS_USABLE}" == "true" ]]; then
                 DOCKER_ROOTLESS_USABLE=true
                 DOCKER_DAEMON_ROOTFUL=false
@@ -306,17 +335,17 @@ detect_capabilities() {
             fi
 
             if ${SERVICE_USER_EXISTS}; then
-                local svc_uid candidate_sock
+                local svc_uid svc_home candidate_sock
                 svc_uid="$(id -u "${SERVICE_USER}")"
+                svc_home="$(resolve_service_user_home "${SERVICE_USER}")"
                 candidate_sock="$(resolve_service_user_docker_socket "${SERVICE_USER}")"
                 if [[ -n "${candidate_sock}" && -S "${candidate_sock}" ]]; then
                     local probed_opts=""
                     if [[ "${EUID}" -eq 0 ]]; then
-                        probed_opts="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' DOCKER_HOST='unix://${candidate_sock}' docker info --format '{{.SecurityOptions}}'" 2>/dev/null || true)"
+                        probed_opts="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" DOCKER_HOST="unix://$3" docker info --format "{{.SecurityOptions}}"' "${svc_home}" "/run/user/${svc_uid}" "${candidate_sock}" 2>/dev/null || true)"
                     elif [[ "$(id -un 2>/dev/null || true)" == "${SERVICE_USER}" ]]; then
-                        probed_opts="$(HOME="/home/${SERVICE_USER}" XDG_RUNTIME_DIR="/run/user/${svc_uid}" DOCKER_HOST="unix://${candidate_sock}" docker info --format '{{.SecurityOptions}}' 2>/dev/null || true)"
+                        probed_opts="$(HOME="${svc_home}" XDG_RUNTIME_DIR="/run/user/${svc_uid}" DOCKER_HOST="unix://${candidate_sock}" docker info --format '{{.SecurityOptions}}' 2>/dev/null || true)"
                     else
-                        # Non-root dry-run inspecting another user's rootless socket
                         probed_opts="rootless"
                     fi
                     if [[ "${probed_opts}" == *"rootless"* ]]; then
@@ -337,7 +366,7 @@ detect_capabilities() {
     # Upstream systemd cgroup delegation and rootless container requirements:
     # https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html
     # https://rootlesscontaine.rs/getting-started/common/cgroup2/
-    if [[ "${OPSKIT_TEST_MODE:-0}" == "1" && -n "${MOCK_CGROUP_DELEGATION:-}" ]]; then
+    if [[ "${OPSKIT_TEST_HOOKS_COMPILED}" == "1" && "${OPSKIT_TEST_MODE:-0}" == "1" && -n "${MOCK_CGROUP_DELEGATION:-}" ]]; then
         if [[ "${MOCK_CGROUP_DELEGATION}" == "true" ]]; then
             CGROUP_DELEGATION_ENABLED=true
         else
@@ -389,7 +418,7 @@ detect_capabilities() {
     FIREWALL_STACK="none"
     if command -v firewalld >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
         FIREWALL_STACK="firewalld"
-    elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -w "active" >/dev/null 2>&1; then
+    elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qE '^Status:[[:space:]]+active'; then
         FIREWALL_STACK="ufw"
     elif command -v nft >/dev/null 2>&1; then
         FIREWALL_STACK="nftables"
@@ -397,14 +426,34 @@ detect_capabilities() {
         FIREWALL_STACK="iptables"
     fi
 
-    # Disk space verification: >= 5 GiB (5,242,880 KB)
+    # Disk space verification: >= 5 GiB (5,242,880 KB) on /var and distinct /home mount
     local target_mount="/var"
     [[ ! -d "${target_mount}" ]] && target_mount="/"
     local avail_kb
     avail_kb="$(df -Pk "${target_mount}" 2>/dev/null | awk 'NR==2 {print $4}')"
     DISK_FREE_GB="${MOCK_DISK_FREE_GB:-$(( ${avail_kb:-0} / 1048576 ))}"
-    if [[ "${avail_kb:-0}" -lt 5242880 ]] && [[ -z "${OPSKIT_SKIP_DISK_CHECK:-}" ]] && [[ -z "${MOCK_DISK_FREE_GB:-}" ]]; then
-        die "${EXIT_VALIDATION_ERROR}" "At least 5 GiB of free disk space is required on ${target_mount}; found ${DISK_FREE_GB} GiB."
+    if [[ -z "${OPSKIT_SKIP_DISK_CHECK:-}" ]]; then
+        if [[ -n "${MOCK_DISK_FREE_GB:-}" ]]; then
+            if [[ ! "${MOCK_DISK_FREE_GB}" =~ ^[0-9]+$ ]] || [[ "${MOCK_DISK_FREE_GB}" -lt 5 ]]; then
+                die "${EXIT_VALIDATION_ERROR}" "At least 5 GiB of free disk space is required on ${target_mount}; found ${MOCK_DISK_FREE_GB} GiB."
+            fi
+        else
+            if [[ "${avail_kb:-0}" -lt 5242880 ]]; then
+                die "${EXIT_VALIDATION_ERROR}" "At least 5 GiB of free disk space is required on ${target_mount}; found ${DISK_FREE_GB} GiB."
+            fi
+            if [[ -d /home ]]; then
+                local var_dev home_dev home_kb home_gb
+                var_dev="$(stat -c %d "${target_mount}" 2>/dev/null || echo "")"
+                home_dev="$(stat -c %d /home 2>/dev/null || echo "")"
+                if [[ -n "${var_dev}" && -n "${home_dev}" && "${var_dev}" != "${home_dev}" ]]; then
+                    home_kb="$(df -Pk /home 2>/dev/null | awk 'NR==2 {print $4}')"
+                    home_gb="$(( ${home_kb:-0} / 1048576 ))"
+                    if [[ "${home_kb:-0}" -lt 5242880 ]]; then
+                        die "${EXIT_VALIDATION_ERROR}" "At least 5 GiB of free disk space is required on /home; found ${home_gb} GiB."
+                    fi
+                fi
+            fi
+        fi
     fi
 
     # Clock skew evaluation: warn > 60s, hard fail > 300s
@@ -413,11 +462,20 @@ detect_capabilities() {
         CLOCK_SKEW_SECONDS=0
         if command -v chronyc >/dev/null 2>&1; then
             local offset
-            offset="$(chronyc tracking 2>/dev/null | awk '/Last offset/ {print $4}' | tr -d '+' | cut -d. -f1 || echo 0)"
+            offset="$(chronyc tracking 2>/dev/null | awk '/System time/ {print $4; exit} /Last offset/ {print $4; exit}' | tr -d '+' | cut -d. -f1 || echo 0)"
             CLOCK_SKEW_SECONDS="${offset:-0}"
         elif command -v timedatectl >/dev/null 2>&1; then
-            if timedatectl status 2>/dev/null | grep -qi "System clock synchronized: yes"; then
+            local td_status
+            td_status="$(timedatectl status 2>/dev/null || true)"
+            if grep -qi "System clock synchronized: yes" <<< "${td_status}"; then
                 CLOCK_SKEW_SECONDS=0
+            elif grep -qi "System clock synchronized: no" <<< "${td_status}"; then
+                log_warn "System clock is not synchronized via NTP (timedatectl reports 'System clock synchronized: no')."
+                local ts_offset
+                ts_offset="$(timedatectl timesync-status 2>/dev/null | awk '/Offset:/ {print $2}' | tr -d '+s' | cut -d. -f1 || true)"
+                if [[ "${ts_offset}" =~ ^-?[0-9]+$ ]]; then
+                    CLOCK_SKEW_SECONDS="${ts_offset}"
+                fi
             fi
         fi
     fi
@@ -429,5 +487,4 @@ detect_capabilities() {
             log_warn "System clock skew is ${CLOCK_SKEW_SECONDS}s (> 60s)."
         fi
     fi
-    # In test mode or when no external reference exists, clock skew is 0
 }

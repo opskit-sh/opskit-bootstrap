@@ -7,8 +7,8 @@ It establishes the rootless container execution environment, provisions the
 service account, configures subordinate UID/GID mappings, enables systemd
 user linger, optionally installs inert root-owned socket activation units for
 public exposure under the direct profile, and records a tamper-evident ledger of
-applied system mutations (authenticated via per-line HMACs, with profile transitions
-rewritten under root control).
+applied system mutations (authenticated via chained per-line HMACs and a signed
+head anchor, with profile transitions rewritten under root control).
 
 ## Supported distributions
 
@@ -42,6 +42,7 @@ strictly identical across all distributions.
 | `--cacert` | `<path>` | Custom CA certificate bundle for network requests |
 | `--artifact-dir` | `<path>` | Local directory containing signed release manifest and pre-downloaded binaries for offline installs |
 | `--no-probe` | None | Skip external inbound TCP 443 reachability probing; verify local port binding only |
+| `--no-http` | None | Direct profile: omit optional port 80 socket unit and firewall rule (bind TCP 443 only) |
 | `--undo` | None | Offline uninstaller: sequentially reverse mutations recorded in `/var/lib/opskit-bootstrap/apply.jsonl` |
 | `--purge` | None | Complete removal option (valid only with `--undo`). Reverses mutations and removes service user, home directory, and data |
 | `--repair` | None | Audit system state against the local ledger, display detected configuration drift, and repair upon authorization |
@@ -85,8 +86,8 @@ strictly identical across all distributions.
 
 Uninstallation supports two contractual covenants:
 
-- **Plain covenant (`--undo`)**: Reverses host-level mutations recorded in the ledger (socket units, firewall rules, and CLI executable). The unprivileged service user, subordinate UID/GID mappings, user linger, and application workloads in the user home directory (`/home/opskit/`) are preserved intact.
-- **Purge covenant (`--undo --purge`)**: Complete teardown of all OpsKit state. Reverses all mutations, disables user linger, removes subordinate UID/GID allocations, deletes the service account and its primary group, and recursively wipes the home directory and all workload data for a zero-trace restoration.
+- **Plain covenant (`--undo`)**: Reverses exposure and CLI mutations recorded in the ledger (socket units, edge unit, firewall rules, and CLI executable). The unprivileged service user, subordinate UID/GID mappings, user linger, cgroup delegation, and application workloads in the user home directory (`/home/opskit/`) are preserved intact, along with a pruned ledger and vendored uninstaller so a later `--undo --purge` remains possible.
+- **Purge covenant (`--undo --purge`)**: Complete teardown of all OpsKit state (requires interactive hostname confirmation or `--yes`). Reverses all mutations, disables user linger, removes subordinate UID/GID allocations, deletes the service account and its primary group, and recursively wipes the home directory and all workload data for a zero-trace restoration.
 
 ## Environment variables
 

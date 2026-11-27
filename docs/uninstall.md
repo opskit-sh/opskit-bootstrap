@@ -9,8 +9,8 @@ OpsKit defines two distinct uninstallation covenants:
 
 | Covenant | Invocation | Privilege | Scope and Resource Boundary |
 |---|---|---|---|
-| **Plain Covenant** | `sudo opskit-bootstrap --undo` | Root (sudo) | Reverses host socket units, host service unit, firewall rules, and CLI executable. **Preserves the service user account, subordinate UID/GID allocations, systemd user linger, and user workloads** in `/home/opskit/` so existing container projects continue operating uninterrupted. |
-| **Purge Covenant** | `sudo opskit-bootstrap --undo --purge` | Root (sudo) | Complete system purge. Reverses all mutations, stops user services, disables user linger, removes subordinate UID/GID ranges, deletes the service account and primary group, and recursively wipes the home directory `/home/opskit/` for a zero-trace return to pre-bootstrap state. |
+| **Plain Covenant** | `sudo opskit-bootstrap --undo` | Root (sudo) | Reverses host socket units, host service unit, user exposure units, firewall rules, and CLI executable. **Preserves the service user account, subordinate UID/GID allocations, systemd user linger, cgroup delegation, and user workloads** in `/home/opskit/`, retaining a pruned ledger and vendored uninstaller so a follow-up `--undo --purge` remains available. |
+| **Purge Covenant** | `sudo opskit-bootstrap --undo --purge` | Root (sudo) | Complete system purge (requires typing the node's hostname interactively, or `--yes`). Reverses all mutations, stops user services, terminates user sessions, disables user linger, removes exact OpsKit-allocated subordinate UID/GID ranges, deletes the service account and primary group, and recursively wipes the home directory `/home/opskit/` for a zero-trace return to pre-bootstrap state. |
 
 Note that standalone `--purge` without `--undo` is rejected with exit code `2` (`USAGE_ERROR`).
 
@@ -42,9 +42,8 @@ in reverse chronological order:
 1. **CLI binary**: Restores pre-existing CLI executable from `/usr/local/bin/opskit.pre-bootstrap`
    if bootstrap found an existing binary (recorded in ledger metadata); otherwise removes
    `/usr/local/bin/opskit`.
-2. **User service units**: Stops user units via `systemctl --user stop` (if user manager is
-   active) and removes unit templates from `~opskit/.config/systemd/user/`.
-5. **Firewall rules**: Reverses the exact rule recorded in metadata using exact port
+2. **User service units**: Disables and stops user exposure units (`opskit-edge.service`, `cloudflared.service`) via `systemctl --user disable --now` and removes them as the service user from `~opskit/.config/systemd/user/`.
+3. **Firewall rules**: Reverses the exact rule recorded in metadata using exact port
    comment targeting (`opskit-443`, `opskit-80`), tag-scoped `ufw` deletion (`ufw --force delete ... comment ...`,
    skipping rules marked `pre_existing: true` and deleting OpsKit-tagged rules even if `ufw` was disabled
    after bootstrap so re-enabling `ufw` cannot resurrect them), `firewalld` permanent rule cleanup
@@ -77,11 +76,11 @@ in reverse chronological order:
 7. **Systemd user linger**: Under plain covenant, linger is preserved; under `--purge`,
    disables linger via `loginctl disable-linger opskit` only if the ledger records it was enabled by OpsKit.
 8. **Subordinate IDs**: Under plain covenant, subordinate UID/GID mappings are preserved;
-   under `--purge`, removes only the OpsKit-allocated `/etc/subuid` / `/etc/subgid` entries (preserving pre-existing ranges).
+   under `--purge`, removes only the exact OpsKit-allocated `/etc/subuid` / `/etc/subgid` entries (preserving pre-existing ranges).
 9. **Service user**: Under plain covenant, the service account is preserved; under `--purge`,
-   removes user `opskit`, group `opskit`, drop-in `/etc/sysusers.d/opskit.conf` (preventing resurrection by `systemd-sysusers`),
-   and `/home/opskit/` only when the ledger records the account was created by OpsKit (pre-existing admin accounts and home directories are preserved).
-10. **Bootstrap state**: Removes `/var/lib/opskit-bootstrap/` and all vendored libraries.
+   terminates user sessions (`loginctl terminate-user`), removes user `opskit`, group `opskit`, drop-in `/etc/sysusers.d/opskit.conf` (preventing resurrection by `systemd-sysusers`),
+   and `/home/opskit/` only when the ledger records the account was created by OpsKit (fails closed if active processes prevent `userdel`).
+10. **Security labels & Bootstrap state**: Executes `restorecon -R /var/lib/opskit` (when available) for `security_labels`. Under `--purge`, removes `/var/lib/opskit-bootstrap/` completely; under plain `--undo`, prunes reversed entries from `apply.jsonl` and retains `/var/lib/opskit-bootstrap/` until `--undo --purge` removes the preserved host entries (removing the directory if zero entries remain).
 
 ### Profile transitions and gate refusal during `--repair`
 

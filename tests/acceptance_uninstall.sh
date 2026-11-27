@@ -48,16 +48,22 @@ chown -R opskit:opskit /home/opskit/opskit
 # 3. Perform offline plain uninstallation
 /var/lib/opskit-bootstrap/opskit-bootstrap --undo >/dev/null
 
-# 4. Assert OpsKit-owned infrastructure is removed
+# 4. Assert OpsKit-owned exposure/CLI infrastructure is removed
 test ! -f /etc/systemd/system/opskit-edge-443.socket
 test ! -f /etc/systemd/system/opskit-edge-80.socket
 test ! -f /etc/systemd/system/opskit-edge.service
 test ! -f /usr/local/bin/opskit
-test ! -d /var/lib/opskit-bootstrap
 if nft list table inet opskit >/dev/null 2>&1; then
     echo "FAIL: nftables table inet opskit still exists after plain undo" >&2
     exit 1
 fi
+
+# Plain undo retains pruned ledger & vendored uninstaller so follow-up --purge remains possible
+test -d /var/lib/opskit-bootstrap
+test -f /var/lib/opskit-bootstrap/apply.jsonl
+! grep -q "\"mutation_id\":\"edge_socket_units\"" /var/lib/opskit-bootstrap/apply.jsonl
+! grep -q "\"mutation_id\":\"fetch_cli\"" /var/lib/opskit-bootstrap/apply.jsonl
+grep -q "\"mutation_id\":\"service_user\"" /var/lib/opskit-bootstrap/apply.jsonl
 
 # 5. Assert service user, subuid, linger, and workloads survive intact
 id opskit >/dev/null
@@ -66,7 +72,12 @@ grep -q "^opskit:" /etc/subgid
 test -f /var/lib/systemd/linger/opskit
 test -f /home/opskit/opskit/deployments/web-service/compose.yml
 
-echo "PASS: Plain uninstall covenant preserved service identity and workloads."
+# 6. Follow-up --undo --purge --yes succeeds from retained pruned ledger
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
+test ! -d /var/lib/opskit-bootstrap
+! id opskit >/dev/null 2>&1
+
+echo "PASS: Plain uninstall covenant preserved service identity/workloads and allowed follow-up --purge."
 '
 }
 
@@ -111,8 +122,16 @@ test -f /usr/local/bin/opskit
 test -d /var/lib/opskit-bootstrap
 test -f /etc/sysusers.d/opskit.conf
 
-# 3. Perform destructive purge uninstallation (--undo --purge)
-/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge >/dev/null
+# 3. Purge without --yes in non-interactive mode must refuse with exit 5
+set +e
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge >/dev/null 2>&1
+purge_guard_rc=$?
+set -e
+test "${purge_guard_rc}" -eq 5
+test -d /var/lib/opskit-bootstrap
+
+# 4. Perform destructive purge uninstallation (--undo --purge --yes)
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
 
 # 4. Assert resurrection impossibility via systemd-sysusers
 systemd-sysusers 2>/dev/null || true
@@ -166,6 +185,8 @@ export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
 
 # 1. Apply bootstrap
 /bootstrap/bin/opskit-bootstrap --profile direct --no-probe --yes >/dev/null
+cp /var/lib/opskit-bootstrap/apply.jsonl /tmp/apply.bak
+cp /var/lib/opskit-bootstrap/ledger.head /tmp/head.bak
 
 # 2. Corrupt a line in apply.jsonl (append corrupt syntax and invalid HMAC)
 echo "{\"timestamp\":\"corrupt\",\"mutation_id\":\"service_user\",\"class\":\"H\",\"before_fingerprint\":\"a\",\"after_fingerprint\":\"b\",\"plan_hash\":\"c\",\"metadata\":{},\"hmac\":\"invalid\"}" >> /var/lib/opskit-bootstrap/apply.jsonl
@@ -187,7 +208,40 @@ if [[ ! -d /var/lib/opskit-bootstrap || ! -f /var/lib/opskit-bootstrap/apply.jso
     exit 1
 fi
 
-echo "PASS: Corrupt ledger line refused with exit 8; state directory preserved intact."
+# 5. Test chained ledger truncation, line deletion, reordering, and missing head anchor
+# (Uses clean /tmp/apply.bak and /tmp/head.bak saved prior to corruption above)
+
+# 5A: Truncated 0-byte apply.jsonl
+: > /var/lib/opskit-bootstrap/apply.jsonl
+set +e
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo >/dev/null 2>&1
+rc_zero=$?
+set -e
+test "${rc_zero}" -eq 8
+
+# 5B: Last line deleted (mismatch with ledger.head)
+head -n -1 /tmp/apply.bak > /var/lib/opskit-bootstrap/apply.jsonl
+set +e
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo >/dev/null 2>&1
+rc_drop=$?
+set -e
+test "${rc_drop}" -eq 8
+
+# 5C: Missing ledger.head
+cp /tmp/apply.bak /var/lib/opskit-bootstrap/apply.jsonl
+rm -f /var/lib/opskit-bootstrap/ledger.head
+set +e
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo >/dev/null 2>&1
+rc_nohead=$?
+set -e
+test "${rc_nohead}" -eq 8
+
+# 5D: --undo succeeds even when pre-bootstrap disk/clock gates would fail
+cp /tmp/head.bak /var/lib/opskit-bootstrap/ledger.head
+OPSKIT_SKIP_DISK_CHECK="" MOCK_DISK_FREE_GB="1" MOCK_CLOCK_SKEW="9999" /var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
+test ! -d /var/lib/opskit-bootstrap
+
+echo "PASS: Corrupt/truncated ledger refused with exit 8; --undo works on degraded disk/clock nodes."
 '
 }
 

@@ -24,6 +24,7 @@ FLAG_RUNTIME="auto"
 FLAG_PROXY=""
 FLAG_CACERT=""
 FLAG_NO_PROBE=""
+FLAG_NO_HTTP=""
 FLAG_ARTIFACT_DIR=""
 FLAG_UNDO=""
 FLAG_PURGE=""
@@ -79,6 +80,10 @@ while [[ $# -gt 0 ]]; do
             FLAG_NO_PROBE=true
             shift
             ;;
+        --no-http)
+            FLAG_NO_HTTP=true
+            shift
+            ;;
         --artifact-dir)
             if [[ $# -lt 2 || "$2" =~ ^-- ]]; then
                 die "${EXIT_USAGE_ERROR}" "Missing path argument for --artifact-dir."
@@ -116,6 +121,7 @@ Flags:
   --proxy <url>                HTTP/HTTPS proxy URL for network operations
   --cacert <path>              Custom CA certificate bundle for network operations
   --no-probe                   Skip external inbound reachability probing
+  --no-http                    Direct profile: omit optional port 80 socket and firewall rule
   --artifact-dir <path>        Offline artifact directory containing manifest and binaries
   --undo                       Offline uninstaller: revert recorded mutations (plain covenant)
   --purge                      When used with --undo: destructive full removal (purge covenant)
@@ -138,36 +144,38 @@ fi
 # Validate test hooks
 validate_test_hooks
 
-export FLAG_DRY_RUN FLAG_PLAN_JSON FLAG_YES FLAG_PROFILE FLAG_RUNTIME FLAG_PROXY FLAG_CACERT FLAG_NO_PROBE FLAG_ARTIFACT_DIR FLAG_UNDO FLAG_PURGE FLAG_REPAIR
+export FLAG_DRY_RUN FLAG_PLAN_JSON FLAG_YES FLAG_PROFILE FLAG_RUNTIME FLAG_PROXY FLAG_CACERT FLAG_NO_PROBE FLAG_NO_HTTP FLAG_ARTIFACT_DIR FLAG_UNDO FLAG_PURGE FLAG_REPAIR
 
-# Load capability detection first to determine family
+# Minimal OS-family detection first so offline --undo is never blocked by pre-bootstrap gates
 source "${LIB_DIR}/detect.sh"
-detect_capabilities
+detect_os_family
 
-# Load family adapter module
 FAMILY_MODULE="${LIB_DIR}/family/${DETECTED_FAMILY}.sh"
 if [[ ! -f "${FAMILY_MODULE}" ]]; then
     die "${EXIT_VALIDATION_ERROR}" "Distribution family adapter '${DETECTED_FAMILY}' not found at '${FAMILY_MODULE}'."
 fi
 source "${FAMILY_MODULE}"
 
-# Load remaining orchestration libraries
-source "${LIB_DIR}/probe.sh"
-source "${LIB_DIR}/plan.sh"
-source "${LIB_DIR}/manifest.sh"
 source "${LIB_DIR}/ledger.sh"
-source "${LIB_DIR}/apply.sh"
 source "${LIB_DIR}/undo.sh"
-source "${LIB_DIR}/repair.sh"
 
-# Pre-flight check for required canonicalize helper
 ensure_canonicalize_helper
 
-# Handle --undo
+# Handle --undo before capability gates (supports recovery on degraded nodes)
 if [[ -n "${FLAG_UNDO}" ]]; then
     undo_mutations
     exit "${EXIT_SUCCESS}"
 fi
+
+# Full capability detection for apply, --dry-run, --plan-json, and --repair
+detect_capabilities
+
+# Load remaining orchestration libraries
+source "${LIB_DIR}/probe.sh"
+source "${LIB_DIR}/plan.sh"
+source "${LIB_DIR}/manifest.sh"
+source "${LIB_DIR}/apply.sh"
+source "${LIB_DIR}/repair.sh"
 
 # Handle --repair
 if [[ -n "${FLAG_REPAIR}" ]]; then
@@ -219,10 +227,20 @@ fi
 ensure_bootstrap_state_dir
 (
     flock -x 201
+    if [[ -z "${MOCK_EXPIRES_AT:-}" && -n "${PLAN_EXPIRES_AT:-}" ]]; then
+        now_epoch="$(date -u +%s)"
+        exp_epoch="$(date -u -d "${PLAN_EXPIRES_AT}" +%s 2>/dev/null || echo 0)"
+        if [[ "${exp_epoch}" -gt 0 && "${now_epoch}" -gt "${exp_epoch}" ]]; then
+            die "${EXIT_CONFLICT}" "Bootstrap plan expired at ${PLAN_EXPIRES_AT}. Re-run bootstrap to compile a fresh plan."
+        fi
+    fi
     detect_capabilities
     compile_plan
     if [[ "${PLAN_HASH}" != "${APPROVED_PLAN_HASH}" ]]; then
         die "${EXIT_CONFLICT}" "Host state changed after plan approval (expected plan hash ${APPROVED_PLAN_HASH}, got ${PLAN_HASH}). Re-run bootstrap to review updated plan."
+    fi
+    if [[ "${CHOSEN_PROFILE}" == "direct" ]]; then
+        verify_local_bind
     fi
     if [[ -f "${LEDGER_FILE}" ]]; then
         if ! validate_entire_ledger; then

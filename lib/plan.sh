@@ -22,17 +22,27 @@ generate_node_fingerprint() {
     compute_sha256 "${source_id}"
 }
 
+# Upstream systemd socket unit directives:
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html
+# Upstream IPv6 dual-stack socket binding semantics:
+# https://man7.org/linux/man-pages/man7/ipv6.7.html
 expected_edge_443_socket() {
-    cat << EOF
+    cat << 'EOF'
 [Unit]
 Description=OpsKit Edge Inbound HTTPS Socket Activation (Port 443)
-PartOf=opskit-edge.service
 
 [Socket]
 ListenStream=0.0.0.0:443
+EOF
+    if has_ipv6_stack; then
+        cat << 'EOF'
 ListenStream=[::]:443
+BindIPv6Only=ipv6-only
+EOF
+    fi
+    cat << 'EOF'
 FileDescriptorName=443
-SocketMode=0660
+NonBlocking=true
 Service=opskit-edge.service
 
 [Install]
@@ -41,16 +51,22 @@ EOF
 }
 
 expected_edge_80_socket() {
-    cat << EOF
+    cat << 'EOF'
 [Unit]
 Description=OpsKit Edge Inbound HTTP Socket Activation (Port 80)
-PartOf=opskit-edge.service
 
 [Socket]
 ListenStream=0.0.0.0:80
+EOF
+    if has_ipv6_stack; then
+        cat << 'EOF'
 ListenStream=[::]:80
+BindIPv6Only=ipv6-only
+EOF
+    fi
+    cat << 'EOF'
 FileDescriptorName=80
-SocketMode=0660
+NonBlocking=true
 Service=opskit-edge.service
 
 [Install]
@@ -58,54 +74,58 @@ WantedBy=sockets.target
 EOF
 }
 
+# Upstream systemd execution sandboxing directives:
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
 expected_edge_system_service() {
+    local sock_deps="opskit-edge-443.socket"
+    if [[ "${FLAG_NO_HTTP:-false}" != "true" ]]; then
+        sock_deps="opskit-edge-443.socket opskit-edge-80.socket"
+    fi
     cat << EOF
 [Unit]
 Description=OpsKit Edge Ingress Server (Direct Profile)
-After=network.target
-Requires=opskit-edge-443.socket
+After=network.target ${sock_deps}
+Requires=${sock_deps}
 
 [Service]
 Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
-ExecStart=/var/lib/opskit/versions/current/opskit-edge
+ExecStart=${SERVICE_STATE_DIR}/versions/current/opskit-edge
 Restart=on-failure
 RestartSec=2s
 LimitNOFILE=65536
-NonBlocking=true
+UMask=0027
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=${SERVICE_STATE_DIR}
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 }
 
-expected_user_cloud_service() {
-    cat << 'EOF'
-[Unit]
-Description=OpsKit Cloud Node Broker
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/var/lib/opskit/versions/current/opskit cloud service
-Restart=always
-RestartSec=5s
-
-[Install]
-WantedBy=default.target
-EOF
-}
-
 expected_user_edge_service() {
-    cat << 'EOF'
+    cat << EOF
 [Unit]
 Description=OpsKit Edge Exposure Boundary (User Scope)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/var/lib/opskit/versions/current/opskit-edge
+ExecStart=${SERVICE_STATE_DIR}/versions/current/opskit-edge
 Restart=always
 RestartSec=3s
 
@@ -164,11 +184,46 @@ compile_plan() {
     NODE_FINGERPRINT="$(generate_node_fingerprint)"
     PLAN_MUTATIONS=()
 
+    local svc_home
+    svc_home="$(resolve_service_user_home "${SERVICE_USER}")"
+    local user_unit_dir="${svc_home}/.config/systemd/user"
+    local esc_user esc_subuid esc_subgid esc_systemd esc_service_dir esc_cli esc_user_unit_dir
+    esc_user="$(json_escape "${SERVICE_USER}")"
+    esc_subuid="$(json_escape "${SUBUID_FILE}")"
+    esc_subgid="$(json_escape "${SUBGID_FILE}")"
+    esc_systemd="$(json_escape "${SYSTEMD_SYSTEM_DIR}")"
+    esc_service_dir="$(json_escape "${SERVICE_STATE_DIR}")"
+    esc_cli="$(json_escape "${CLI_INSTALL_PATH}")"
+    esc_user_unit_dir="$(json_escape "${user_unit_dir}")"
+
+    # Surface profile transition teardown in the approved plan when switching profiles
+    if [[ -f "${LEDGER_FILE}" ]]; then
+        local recorded_prof
+        recorded_prof="$(get_recorded_profile_from_ledger)"
+        if [[ -n "${recorded_prof}" && "${recorded_prof}" != "${CHOSEN_PROFILE}" ]]; then
+            local trans_req_root=false trans_desc="" trans_target=""
+            if [[ "${recorded_prof}" == "direct" ]]; then
+                trans_req_root=true
+                trans_desc="Remove retired direct-profile socket units, system edge unit, and firewall rules during transition to '${CHOSEN_PROFILE}'"
+                trans_target="${esc_systemd}/opskit-edge*.socket, ${esc_systemd}/opskit-edge.service, $(json_escape "${FIREWALL_STACK}")"
+            elif [[ "${recorded_prof}" == "tunnel" ]]; then
+                trans_desc="Remove retired cloudflared user unit during transition to '${CHOSEN_PROFILE}'"
+                trans_target="${esc_user_unit_dir}/cloudflared.service"
+            else
+                trans_desc="Remove retired user-scope opskit-edge unit during transition to '${CHOSEN_PROFILE}'"
+                trans_target="${esc_user_unit_dir}/opskit-edge.service"
+            fi
+            PLAN_MUTATIONS+=(
+                "{\"id\":\"profile_transition\",\"class\":\"H\",\"requires_root\":${trans_req_root},\"description\":\"$(json_escape "${trans_desc}")\",\"target\":\"${trans_target}\",\"rollback\":\"Re-run bootstrap with --profile $(json_escape "${recorded_prof}")\"}"
+            )
+        fi
+    fi
+
     # Mutation 1: Packages
     local need_packages=false
     if ${PODMAN_PACKAGE_NEEDED} || ${UIDMAP_PACKAGE_NEEDED} || ${DOCKER_ROOTLESS_PACKAGE_NEEDED:-false}; then
         need_packages=true
-    elif [[ "${OPSKIT_TEST_MODE:-0}" == "1" && "${OPSKIT_TEST_FORCE_PACKAGES:-0}" == "1" ]]; then
+    elif [[ "${OPSKIT_TEST_HOOKS_COMPILED}" == "1" && "${OPSKIT_TEST_MODE:-0}" == "1" && "${OPSKIT_TEST_FORCE_PACKAGES:-0}" == "1" ]]; then
         need_packages=true
     fi
     if ${need_packages}; then
@@ -188,7 +243,7 @@ compile_plan() {
                 pkgs+=("${rd_pkg}")
             done
         fi
-        if [[ ${#pkgs[@]} -eq 0 ]] && [[ "${OPSKIT_TEST_MODE:-0}" == "1" && "${OPSKIT_TEST_FORCE_PACKAGES:-0}" == "1" ]]; then
+        if [[ ${#pkgs[@]} -eq 0 ]] && [[ "${OPSKIT_TEST_HOOKS_COMPILED}" == "1" && "${OPSKIT_TEST_MODE:-0}" == "1" && "${OPSKIT_TEST_FORCE_PACKAGES:-0}" == "1" ]]; then
             case "${DETECTED_FAMILY}" in
                 debian) pkgs=("podman" "uidmap") ;;
                 rhel) pkgs=("podman" "shadow-utils") ;;
@@ -206,7 +261,7 @@ compile_plan() {
             *) target_tool="${DETECTED_FAMILY} package manager" ;;
         esac
         PLAN_MUTATIONS+=(
-            "{\"id\":\"packages\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Install missing container runtime packages: ${pkg_list}\",\"target\":\"${target_tool}\",\"rollback\":\"Remove installed packages\"}"
+            "{\"id\":\"packages\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Install missing container runtime packages: $(json_escape "${pkg_list}")\",\"target\":\"$(json_escape "${target_tool}")\",\"rollback\":\"Retain installed system packages for host stability\"}"
         )
     fi
 
@@ -217,7 +272,7 @@ compile_plan() {
     fi
     if ${need_service_user}; then
         PLAN_MUTATIONS+=(
-            "{\"id\":\"service_user\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Provision rootless service account and primary group '${SERVICE_USER}'\",\"target\":\"/etc/passwd, /etc/group\",\"rollback\":\"userdel -r ${SERVICE_USER}\"}"
+            "{\"id\":\"service_user\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Provision rootless service account and primary group '${esc_user}'\",\"target\":\"/etc/passwd, /etc/group\",\"rollback\":\"userdel -r ${esc_user}\"}"
         )
     fi
 
@@ -228,24 +283,28 @@ compile_plan() {
     fi
     if ${need_subuid}; then
         PLAN_MUTATIONS+=(
-            "{\"id\":\"subuid_allocation\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Allocate subordinate UID/GID range for '${SERVICE_USER}' (65536 IDs, no clobber)\",\"target\":\"${SUBUID_FILE}, ${SUBGID_FILE}\",\"rollback\":\"Remove allocated range from subuid and subgid files\"}"
+            "{\"id\":\"subuid_allocation\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Allocate subordinate UID/GID range for '${esc_user}' (65536 IDs, no clobber)\",\"target\":\"${esc_subuid}, ${esc_subgid}\",\"rollback\":\"Remove allocated range from subuid and subgid files\"}"
         )
     fi
 
     # Mutation 3b: Systemd cgroup v2 delegation (Delegate=yes)
     # Upstream systemd resource control: https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html
     local delegate_dropin="${SYSTEMD_SYSTEM_DIR}/user@.service.d/opskit-delegate.conf"
+    local esc_delegate_dropin
+    esc_delegate_dropin="$(json_escape "${delegate_dropin}")"
     local need_cgroup_delegation=false
     if ! ${CGROUP_DELEGATION_ENABLED}; then
         need_cgroup_delegation=true
     elif [[ -f "${delegate_dropin}" ]] && ! file_matches_expected "${delegate_dropin}" expected_cgroup_delegate_conf; then
+        need_cgroup_delegation=true
+    elif [[ -f "${delegate_dropin}" && "${EUID:-1}" -eq 0 && "$(stat -c '%a:%u:%g' "${delegate_dropin}" 2>/dev/null || true)" != "644:0:0" ]]; then
         need_cgroup_delegation=true
     elif ! is_mutation_recorded "cgroup_delegation"; then
         need_cgroup_delegation=true
     fi
     if ${need_cgroup_delegation}; then
         PLAN_MUTATIONS+=(
-            "{\"id\":\"cgroup_delegation\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Enable systemd cgroup v2 delegation (Delegate=yes) for user slice '${SERVICE_USER}'\",\"target\":\"${delegate_dropin}\",\"rollback\":\"rm -f ${delegate_dropin} && systemctl daemon-reload\"}"
+            "{\"id\":\"cgroup_delegation\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Enable systemd cgroup v2 delegation (Delegate=yes) for user slice '${esc_user}'\",\"target\":\"${esc_delegate_dropin}\",\"rollback\":\"rm -f ${esc_delegate_dropin} && systemctl daemon-reload\"}"
         )
     fi
 
@@ -256,14 +315,16 @@ compile_plan() {
     fi
     if ${need_linger}; then
         PLAN_MUTATIONS+=(
-            "{\"id\":\"user_linger\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Enable systemd user linger for '${SERVICE_USER}' to allow background service execution\",\"target\":\"/var/lib/systemd/linger/${SERVICE_USER}\",\"rollback\":\"loginctl disable-linger ${SERVICE_USER}\"}"
+            "{\"id\":\"user_linger\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Enable systemd user linger for '${esc_user}' to allow background service execution\",\"target\":\"/var/lib/systemd/linger/${esc_user}\",\"rollback\":\"loginctl disable-linger ${esc_user}\"}"
         )
     fi
 
     # Mutation 4b: Rootless Docker provisioning (when Docker is selected)
     # Upstream rootless Docker setup: https://docs.docker.com/engine/security/rootless/
     if [[ "${DETECTED_RUNTIME}" == "docker" ]]; then
-        local docker_env_file="/home/${SERVICE_USER}/.config/environment.d/opskit-docker.conf"
+        local docker_env_file="${svc_home}/.config/environment.d/opskit-docker.conf"
+        local esc_docker_env
+        esc_docker_env="$(json_escape "${docker_env_file}")"
         local need_rootless_docker=false
         if ! ${DOCKER_ROOTLESS_USABLE}; then
             need_rootless_docker=true
@@ -272,75 +333,104 @@ compile_plan() {
         fi
         if ${need_rootless_docker}; then
             PLAN_MUTATIONS+=(
-                "{\"id\":\"rootless_docker\",\"class\":\"U\",\"requires_root\":false,\"description\":\"Provision rootless Docker daemon and DOCKER_HOST for '${SERVICE_USER}'\",\"target\":\"/home/${SERVICE_USER}/.config/systemd/user/docker.service, ${docker_env_file}\",\"rollback\":\"dockerd-rootless-setuptool.sh uninstall && rm -f ${docker_env_file}\"}"
+                "{\"id\":\"rootless_docker\",\"class\":\"U\",\"requires_root\":false,\"description\":\"Provision rootless Docker daemon and DOCKER_HOST for '${esc_user}'\",\"target\":\"${esc_user_unit_dir}/docker.service, ${esc_docker_env}\",\"rollback\":\"dockerd-rootless-setuptool.sh uninstall && rm -f ${esc_docker_env}\"}"
             )
         fi
     fi
 
-    # Mutations for direct profile
+    # Mutations for direct profile (system edge unit MUST be installed before socket units)
     if [[ "${CHOSEN_PROFILE}" == "direct" ]]; then
-        # Mutation 5: Edge socket units (ledger-based reconciliation)
-        local need_sockets=false
-        if [[ ! -f "${SYSTEMD_SYSTEM_DIR}/opskit-edge-443.socket" || ! -f "${SYSTEMD_SYSTEM_DIR}/opskit-edge-80.socket" ]]; then
-            need_sockets=true
-        elif ! file_matches_expected "${SYSTEMD_SYSTEM_DIR}/opskit-edge-443.socket" expected_edge_443_socket || ! file_matches_expected "${SYSTEMD_SYSTEM_DIR}/opskit-edge-80.socket" expected_edge_80_socket; then
-            need_sockets=true
-        elif [[ -f "${LEDGER_FILE}" ]] && ! is_mutation_recorded "edge_socket_units"; then
-            need_sockets=true
-        fi
-        if ${need_sockets}; then
-            PLAN_MUTATIONS+=(
-                "{\"id\":\"edge_socket_units\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Install inert systemd socket activation units for port 443 and port 80\",\"target\":\"${SYSTEMD_SYSTEM_DIR}/opskit-edge-443.socket, ${SYSTEMD_SYSTEM_DIR}/opskit-edge-80.socket\",\"rollback\":\"systemctl disable --now opskit-edge-443.socket opskit-edge-80.socket && rm -f ${SYSTEMD_SYSTEM_DIR}/opskit-edge-*.socket\"}"
-            )
-        fi
-
-        # Mutation 6: Edge system service unit (ledger-based reconciliation)
+        # Mutation 5a: Edge system service unit
         local need_edge_system=false
-        if [[ ! -f "${SYSTEMD_SYSTEM_DIR}/opskit-edge.service" ]]; then
+        local esvc_path="${SYSTEMD_SYSTEM_DIR}/opskit-edge.service"
+        if [[ ! -f "${esvc_path}" ]]; then
             need_edge_system=true
-        elif ! file_matches_expected "${SYSTEMD_SYSTEM_DIR}/opskit-edge.service" expected_edge_system_service; then
+        elif ! file_matches_expected "${esvc_path}" expected_edge_system_service; then
+            need_edge_system=true
+        elif [[ "${EUID:-1}" -eq 0 && "$(stat -c '%a:%u:%g' "${esvc_path}" 2>/dev/null || true)" != "644:0:0" ]]; then
             need_edge_system=true
         elif [[ -f "${LEDGER_FILE}" ]] && ! is_mutation_recorded "edge_system_unit"; then
             need_edge_system=true
         fi
         if ${need_edge_system}; then
             PLAN_MUTATIONS+=(
-                "{\"id\":\"edge_system_unit\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Install root-owned systemd service unit for edge process (User=${SERVICE_USER})\",\"target\":\"${SYSTEMD_SYSTEM_DIR}/opskit-edge.service\",\"rollback\":\"systemctl disable --now opskit-edge.service && rm -f ${SYSTEMD_SYSTEM_DIR}/opskit-edge.service\"}"
+                "{\"id\":\"edge_system_unit\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Install root-owned systemd service unit for edge process (User=${esc_user})\",\"target\":\"${esc_systemd}/opskit-edge.service\",\"rollback\":\"systemctl disable --now opskit-edge.service && rm -f ${esc_systemd}/opskit-edge.service\"}"
             )
+        fi
+
+        # Mutation 5b: Edge socket units (port 443 + optional port 80)
+        local need_sockets=false
+        local s443_path="${SYSTEMD_SYSTEM_DIR}/opskit-edge-443.socket"
+        local s80_path="${SYSTEMD_SYSTEM_DIR}/opskit-edge-80.socket"
+        if [[ ! -f "${s443_path}" ]] || ! file_matches_expected "${s443_path}" expected_edge_443_socket; then
+            need_sockets=true
+        elif [[ "${EUID:-1}" -eq 0 && "$(stat -c '%a:%u:%g' "${s443_path}" 2>/dev/null || true)" != "644:0:0" ]]; then
+            need_sockets=true
+        elif [[ "${FLAG_NO_HTTP:-false}" != "true" ]] && { [[ ! -f "${s80_path}" ]] || ! file_matches_expected "${s80_path}" expected_edge_80_socket || [[ "${EUID:-1}" -eq 0 && "$(stat -c '%a:%u:%g' "${s80_path}" 2>/dev/null || true)" != "644:0:0" ]]; }; then
+            need_sockets=true
+        elif [[ "${FLAG_NO_HTTP:-false}" == "true" && -f "${s80_path}" ]]; then
+            need_sockets=true
+        elif [[ "${SYSTEMD_RUNNING:-false}" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+            if ! systemctl is-enabled --quiet opskit-edge-443.socket 2>/dev/null || ! systemctl is-active --quiet opskit-edge-443.socket 2>/dev/null; then
+                need_sockets=true
+            elif [[ "${FLAG_NO_HTTP:-false}" != "true" ]] && { ! systemctl is-enabled --quiet opskit-edge-80.socket 2>/dev/null || ! systemctl is-active --quiet opskit-edge-80.socket 2>/dev/null; }; then
+                need_sockets=true
+            fi
+        fi
+        if ! ${need_sockets} && [[ -f "${LEDGER_FILE}" ]] && ! is_mutation_recorded "edge_socket_units"; then
+            need_sockets=true
+        fi
+        if ${need_sockets}; then
+            if [[ "${FLAG_NO_HTTP:-false}" == "true" ]]; then
+                PLAN_MUTATIONS+=(
+                    "{\"id\":\"edge_socket_units\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Install inert systemd socket activation unit for port 443\",\"target\":\"${esc_systemd}/opskit-edge-443.socket\",\"rollback\":\"systemctl disable --now opskit-edge-443.socket && rm -f ${esc_systemd}/opskit-edge-443.socket\"}"
+                )
+            else
+                PLAN_MUTATIONS+=(
+                    "{\"id\":\"edge_socket_units\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Install inert systemd socket activation units for port 443 and port 80\",\"target\":\"${esc_systemd}/opskit-edge-443.socket, ${esc_systemd}/opskit-edge-80.socket\",\"rollback\":\"systemctl disable --now opskit-edge-443.socket opskit-edge-80.socket && rm -f ${esc_systemd}/opskit-edge-*.socket\"}"
+                )
+            fi
         fi
 
         # Mutation 7: Firewall rules (ledger-based reconciliation)
         local need_firewall=false
-        if ! family_has_firewall_rule 443 tcp || ! family_has_firewall_rule 80 tcp; then
+        if ! family_has_firewall_rule 443 tcp; then
+            need_firewall=true
+        elif [[ "${FLAG_NO_HTTP:-false}" != "true" ]] && ! family_has_firewall_rule 80 tcp; then
             need_firewall=true
         elif [[ -f "${LEDGER_FILE}" ]] && ! is_mutation_recorded "firewall_rules"; then
             need_firewall=true
         fi
         if ${need_firewall}; then
-            PLAN_MUTATIONS+=(
-                "{\"id\":\"firewall_rules\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Allow inbound TCP traffic on ports 443 and 80 in ${FIREWALL_STACK}\",\"target\":\"${FIREWALL_STACK} allow tcp 443, 80\",\"rollback\":\"Remove allowed rule for ports 443 and 80 from ${FIREWALL_STACK}\"}"
-            )
+            local esc_fw
+            esc_fw="$(json_escape "${FIREWALL_STACK}")"
+            if [[ "${FLAG_NO_HTTP:-false}" == "true" ]]; then
+                PLAN_MUTATIONS+=(
+                    "{\"id\":\"firewall_rules\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Allow inbound TCP traffic on port 443 in ${esc_fw}\",\"target\":\"${esc_fw} allow tcp 443\",\"rollback\":\"Remove allowed rule for port 443 from ${esc_fw}\"}"
+                )
+            else
+                PLAN_MUTATIONS+=(
+                    "{\"id\":\"firewall_rules\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Allow inbound TCP traffic on ports 443 and 80 in ${esc_fw}\",\"target\":\"${esc_fw} allow tcp 443, 80\",\"rollback\":\"Remove allowed rule for ports 443 and 80 from ${esc_fw}\"}"
+                )
+            fi
         fi
     fi
 
-    # Mutation 8: User service units (ledger-based reconciliation)
-    local user_unit_dir="/home/${SERVICE_USER}/.config/systemd/user"
-    local need_service_units=false
-    if [[ ! -f "${user_unit_dir}/opskit-cloud.service" ]]; then
-        need_service_units=true
-    elif ! file_matches_expected "${user_unit_dir}/opskit-cloud.service" expected_user_cloud_service; then
-        need_service_units=true
-    elif [[ "${CHOSEN_PROFILE}" != "direct" && ! -f "${user_unit_dir}/opskit-edge.service" ]]; then
-        need_service_units=true
-    elif [[ "${CHOSEN_PROFILE}" != "direct" ]] && ! file_matches_expected "${user_unit_dir}/opskit-edge.service" expected_user_edge_service; then
-        need_service_units=true
-    elif [[ -f "${LEDGER_FILE}" ]] && { ! is_mutation_recorded "service_units" || [[ "$(get_recorded_profile_from_ledger)" != "${CHOSEN_PROFILE}" ]]; }; then
-        need_service_units=true
-    fi
-    if ${need_service_units}; then
-        PLAN_MUTATIONS+=(
-            "{\"id\":\"service_units\",\"class\":\"U\",\"requires_root\":false,\"description\":\"Install user units for opskit-cloud and opskit-edge under service account\",\"target\":\"${user_unit_dir}\",\"rollback\":\"rm -f ${user_unit_dir}/opskit-*.service\"}"
-        )
+    # Mutation 8: User exposure unit (tunnel/private profiles only; opskit-cloud.service is owned by enrollment)
+    if [[ "${CHOSEN_PROFILE}" != "direct" ]]; then
+        local need_service_units=false
+        if [[ ! -f "${user_unit_dir}/opskit-edge.service" ]]; then
+            need_service_units=true
+        elif ! file_matches_expected "${user_unit_dir}/opskit-edge.service" expected_user_edge_service; then
+            need_service_units=true
+        elif [[ -f "${LEDGER_FILE}" ]] && { ! is_mutation_recorded "service_units" || [[ "$(get_recorded_profile_from_ledger)" != "${CHOSEN_PROFILE}" ]]; }; then
+            need_service_units=true
+        fi
+        if ${need_service_units}; then
+            PLAN_MUTATIONS+=(
+                "{\"id\":\"service_units\",\"class\":\"U\",\"requires_root\":false,\"description\":\"Install user unit for opskit-edge under service account\",\"target\":\"${esc_user_unit_dir}\",\"rollback\":\"systemctl --user disable --now opskit-edge.service && rm -f ${esc_user_unit_dir}/opskit-edge.service\"}"
+            )
+        fi
     fi
 
     # Mutation 9: Tunnel unit (tunnel profile only, ledger-based reconciliation)
@@ -355,7 +445,7 @@ compile_plan() {
         fi
         if ${need_tunnel_unit}; then
             PLAN_MUTATIONS+=(
-                "{\"id\":\"cloudflared_unit\",\"class\":\"U\",\"requires_root\":false,\"description\":\"Install user service template for cloudflared tunnel daemon\",\"target\":\"${user_unit_dir}/cloudflared.service\",\"rollback\":\"rm -f ${user_unit_dir}/cloudflared.service\"}"
+                "{\"id\":\"cloudflared_unit\",\"class\":\"U\",\"requires_root\":false,\"description\":\"Install user service template for cloudflared tunnel daemon\",\"target\":\"${esc_user_unit_dir}/cloudflared.service\",\"rollback\":\"rm -f ${esc_user_unit_dir}/cloudflared.service\"}"
             )
         fi
     fi
@@ -374,7 +464,7 @@ compile_plan() {
         fi
         if ${need_security_labels}; then
             PLAN_MUTATIONS+=(
-                "{\"id\":\"security_labels\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Apply SELinux container storage contexts to service state directories\",\"target\":\"${SERVICE_STATE_DIR}\",\"rollback\":\"restorecon -R ${SERVICE_STATE_DIR}\"}"
+                "{\"id\":\"security_labels\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Apply SELinux container storage contexts to service state directories\",\"target\":\"${esc_service_dir}\",\"rollback\":\"restorecon -R ${esc_service_dir}\"}"
             )
         fi
     fi
@@ -425,7 +515,6 @@ with open(sys.argv[1], 'r') as f:
     fi
 
     if ${cli_needs_install}; then
-        # Pre-flight check: ensure an explicit manifest source is resolvable (never treat on-disk binary as source)
         local has_artifact_source=false
         local local_manifest_path=""
         if [[ -n "${FLAG_ARTIFACT_DIR:-}" ]]; then
@@ -456,17 +545,15 @@ with open(sys.argv[1], 'r') as f:
             die "${EXIT_NETWORK_ERROR}" "No release manifest source provided and ${CLI_INSTALL_PATH} requires verified installation. Provide --artifact-dir <path> (or set OPSKIT_ARTIFACT_SOURCE_DIR) for offline installation, or set OPSKIT_MANIFEST_URL to download release artifacts."
         fi
 
-        # Pre-flight validation of local manifest architecture, signature, and payload digest/size
         if [[ -n "${local_manifest_path}" ]]; then
-            local host_arch
+            local host_arch pubkey
             host_arch="$(uname -m)"
-            local pubkey
             pubkey="$(get_release_pubkey)"
             verify_local_manifest_preflight "${local_manifest_path}" "${pubkey}" "${host_arch}"
         fi
 
         PLAN_MUTATIONS+=(
-            "{\"id\":\"fetch_cli\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Install verified static opskit binary to ${CLI_INSTALL_PATH} via signed manifest\",\"target\":\"${CLI_INSTALL_PATH}\",\"rollback\":\"Restore pre-existing state or remove binary\"}"
+            "{\"id\":\"fetch_cli\",\"class\":\"H\",\"requires_root\":true,\"description\":\"Install verified static opskit binary to ${esc_cli} via signed manifest\",\"target\":\"${esc_cli}\",\"rollback\":\"Restore pre-existing state or remove binary\"}"
         )
     fi
 
@@ -475,7 +562,6 @@ with open(sys.argv[1], 'r') as f:
         NO_CHANGES=true
     fi
 
-    # Assemble canonical JSON machine plan
     local ctrl_json=""
     local i=0
     for c in "${CGROUP_CONTROLLERS[@]}"; do
@@ -506,7 +592,7 @@ with open(sys.argv[1], 'r') as f:
     local postcond_json
     postcond_json="$(IFS=', '; echo "${postcond_items[*]}")"
 
-    PLAN_JSON="{\"schema\":\"opskit.bootstrap-plan/v1\",\"node_fingerprint\":\"$(json_escape "${NODE_FINGERPRINT}")\",\"capabilities\":{\"os_id\":\"$(json_escape "${OS_ID}")\",\"os_version\":\"$(json_escape "${OS_VERSION_ID}")\",\"os_name\":\"$(json_escape "${OS_NAME}")\",\"kernel\":\"$(json_escape "${KERNEL_RELEASE}")\",\"kernel_ok\":true,\"cgroups_v2\":${CGROUPS_V2},\"cgroup_controllers\":[${ctrl_json}],\"systemd_running\":${SYSTEMD_RUNNING},\"systemd_user_manager\":${SYSTEMD_USER_MANAGER},\"runtime\":\"$(json_escape "${DETECTED_RUNTIME}")\",\"runtime_version\":\"$(json_escape "${RUNTIME_VERSION}")\",\"newuidmap_present\":${NEWUIDMAP_PRESENT},\"newgidmap_present\":${NEWGIDMAP_PRESENT},\"subuid_allocated\":${SUBUID_ALLOCATED},\"subuid_range\":\"$(json_escape "${EXISTING_SUBUID_RANGE}")\",\"service_user_present\":${SERVICE_USER_EXISTS},\"selinux_status\":\"$(json_escape "${SELINUX_STATUS}")\",\"apparmor_status\":\"$(json_escape "${APPARMOR_STATUS}")\",\"firewall_stack\":\"$(json_escape "${FIREWALL_STACK}")\",\"disk_free_gb\":${DISK_FREE_GB},\"clock_skew_seconds\":${CLOCK_SKEW_SECONDS},\"linger_enabled\":${LINGER_ACTIVE},\"docker_rootless_usable\":${DOCKER_ROOTLESS_USABLE},\"docker_daemon_rootful\":${DOCKER_DAEMON_ROOTFUL},\"cgroup_delegation_enabled\":${CGROUP_DELEGATION_ENABLED}},\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\",\"runtime\":\"$(json_escape "${DETECTED_RUNTIME}")\",\"mutations\":[${mut_json}],\"no_changes\":${NO_CHANGES},\"probe_results\":{\"status\":\"$(json_escape "${PROBE_STATUS}")\",\"reachable_v4\":${PROBE_REACHABLE_V4},\"reachable_v6\":${PROBE_REACHABLE_V6},\"details\":\"$(json_escape "${PROBE_DETAILS}")\"},\"postconditions\":[${postcond_json}],\"expires_at\":\"${expires_at}\"}"
+    PLAN_JSON="{\"schema\":\"opskit.bootstrap-plan/v1\",\"node_fingerprint\":\"$(json_escape "${NODE_FINGERPRINT}")\",\"capabilities\":{\"os_id\":\"$(json_escape "${OS_ID}")\",\"os_version\":\"$(json_escape "${OS_VERSION_ID}")\",\"os_name\":\"$(json_escape "${OS_NAME}")\",\"kernel\":\"$(json_escape "${KERNEL_RELEASE}")\",\"kernel_ok\":true,\"cgroups_v2\":${CGROUPS_V2},\"cgroup_controllers\":[${ctrl_json}],\"systemd_running\":${SYSTEMD_RUNNING},\"systemd_user_manager\":${SYSTEMD_USER_MANAGER},\"runtime\":\"$(json_escape "${DETECTED_RUNTIME}")\",\"runtime_version\":\"$(json_escape "${RUNTIME_VERSION}")\",\"newuidmap_present\":${NEWUIDMAP_PRESENT},\"newgidmap_present\":${NEWGIDMAP_PRESENT},\"subuid_allocated\":${SUBUID_ALLOCATED},\"subuid_range\":\"$(json_escape "${EXISTING_SUBUID_RANGE}")\",\"service_user_present\":${SERVICE_USER_EXISTS},\"selinux_status\":\"$(json_escape "${SELINUX_STATUS}")\",\"apparmor_status\":\"$(json_escape "${APPARMOR_STATUS}")\",\"firewall_stack\":\"$(json_escape "${FIREWALL_STACK}")\",\"disk_free_gb\":${DISK_FREE_GB},\"clock_skew_seconds\":${CLOCK_SKEW_SECONDS},\"linger_enabled\":${LINGER_ACTIVE},\"docker_rootless_usable\":${DOCKER_ROOTLESS_USABLE},\"docker_daemon_rootful\":${DOCKER_DAEMON_ROOTFUL},\"cgroup_delegation_enabled\":${CGROUP_DELEGATION_ENABLED}},\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\",\"runtime\":\"$(json_escape "${DETECTED_RUNTIME}")\",\"mutations\":[${mut_json}],\"no_changes\":${NO_CHANGES},\"probe_results\":{\"status\":\"$(json_escape "${PROBE_STATUS}")\",\"reachable_v4\":${PROBE_REACHABLE_V4},\"reachable_v6\":${PROBE_REACHABLE_V6},\"details\":\"$(json_escape "${PROBE_DETAILS}")\"},\"postconditions\":[${postcond_json}],\"expires_at\":\"$(json_escape "${expires_at}")\"}"
 
     PLAN_HASH="$(compute_sha256 "${PLAN_JSON}")"
 }

@@ -685,4 +685,155 @@ test_non_positive_size_rejection
 test_preflight_checks_local_binary_presence_and_digest
 test_missing_manifest_in_artifact_dir_and_no_binary_fallback
 
+# Test 18: Path traversal in manifest filename rejected before download/copy
+test_filename_path_traversal_rejection() {
+    echo "--- Test 18: Path traversal in manifest filename rejection ---"
+    local test_dir="${TEST_TEMP_DIR}/traversal"
+    mkdir -p "${test_dir}"
+    local temp_key="${TEST_TEMP_DIR}/trav.key"
+    openssl genpkey -algorithm ed25519 -out "${temp_key}" 2>/dev/null
+    openssl pkey -in "${temp_key}" -pubout -out "${test_dir}/release.pub" 2>/dev/null
+    echo "test-release-key-1" > "${test_dir}/release.key_id"
+
+    python3 -B -c "
+import json, subprocess, os
+with open('${FIXTURE_DIR}/release-manifest.json', 'r') as f:
+    d = json.load(f)
+d.pop('signatures', None)
+host_arch = os.uname().machine
+d['artifacts'][f'opskit-linux-{host_arch}']['filename'] = '../../evil-payload'
+canon = json.dumps(d, separators=(',', ':'), sort_keys=True, ensure_ascii=False).encode('utf-8')
+canon_file = '${test_dir}/canon.tmp'
+with open(canon_file, 'wb') as f:
+    f.write(canon)
+p = subprocess.run(['openssl', 'pkeyutl', '-sign', '-inkey', '${temp_key}', '-rawin', '-in', canon_file], stdout=subprocess.PIPE, check=True)
+os.remove(canon_file)
+d['signatures'] = [{'key_id': 'test-release-key-1', 'algorithm': 'ed25519', 'signature': p.stdout.hex()}]
+with open('${test_dir}/release-manifest.json', 'w') as f:
+    json.dump(d, f)
+"
+    rm -f "${temp_key}"
+
+    local target_bin="${TEST_TEMP_DIR}/opskit_trav"
+    set +e
+    local out
+    out="$( ( OPSKIT_ARTIFACT_SOURCE_DIR="${test_dir}" OPSKIT_RELEASE_PUBKEY="${test_dir}/release.pub" OPSKIT_EXPECTED_KEY_ID="test-release-key-1" CLI_INSTALL_PATH="${target_bin}" verify_and_install_cli ) 2>&1 )"
+    local code=$?
+    set -e
+    if [[ ${code} -ne 8 ]] || [[ "${out}" != *"Invalid artifact filename"* ]]; then
+        echo "FAIL: expected exit 8 on filename traversal, got ${code}: ${out}" >&2
+        return 1
+    fi
+    echo "PASS: Manifest filename path traversal rejected with exit 8."
+}
+
+# Test 19: Path-override env vars rejected in production and dangerous paths rejected in test mode
+test_path_override_gating() {
+    echo "--- Test 19: Path-override env var gating ---"
+    for pvar in OPSKIT_BOOTSTRAP_STATE_DIR OPSKIT_SERVICE_STATE_DIR OPSKIT_CLI_INSTALL_PATH OPSKIT_SYSTEMD_SYSTEM_DIR OPSKIT_SUBUID_FILE OPSKIT_SUBGID_FILE; do
+        set +e
+        local out
+        out="$( env OPSKIT_TEST_MODE="0" "${pvar}=/tmp/override_test" "${BOOTSTRAP_BIN}" --dry-run 2>&1 )"
+        local code=$?
+        set -e
+        if [[ ${code} -ne 8 ]] || [[ "${out}" != *"forbidden in production"* ]]; then
+            echo "FAIL: ${pvar} not rejected outside test mode (code=${code}): ${out}" >&2
+            return 1
+        fi
+    done
+    for bad_path in "/" "/etc" "/etc/systemd" "/var/lib" "/tmp/../etc"; do
+        set +e
+        local bad_out
+        bad_out="$( env OPSKIT_TEST_MODE="1" OPSKIT_SERVICE_STATE_DIR="${bad_path}" "${BOOTSTRAP_BIN}" --dry-run 2>&1 )"
+        local bad_rc=$?
+        set -e
+        if [[ ${bad_rc} -ne 8 ]]; then
+            echo "FAIL: dangerous override '${bad_path}' not rejected in test mode (code=${bad_rc}): ${bad_out}" >&2
+            return 1
+        fi
+    done
+    echo "PASS: Privileged path-override env vars strictly gated and validated."
+}
+
+# Test 20: Non-HTTPS remote URLs rejected and production release bundle locks down test mode
+test_https_enforcement_and_production_bundle() {
+    echo "--- Test 20: HTTPS URL enforcement and production release bundle lockdown ---"
+    set +e
+    local http_out file_out
+    http_out="$( ( OPSKIT_TEST_MODE="0" validate_remote_url "http://example.com/manifest.json" "manifest URL" ) 2>&1 )"
+    local http_rc=$?
+    file_out="$( ( validate_remote_url "file:///etc/passwd" "manifest URL" ) 2>&1 )"
+    local file_rc=$?
+    set -e
+    if [[ ${http_rc} -ne 8 || ${file_rc} -ne 8 ]]; then
+        echo "FAIL: insecure URLs were not rejected (http=${http_rc}, file=${file_rc})" >&2
+        return 1
+    fi
+
+    local prod_bundle="${TEST_TEMP_DIR}/prod_bundle"
+    bash "${REPO_ROOT}/scripts/build-release.sh" "${prod_bundle}" >/dev/null
+    set +e
+    local prod_out
+    prod_out="$( env OPSKIT_TEST_MODE="1" "${prod_bundle}/bin/opskit-bootstrap" --dry-run 2>&1 )"
+    local prod_rc=$?
+    set -e
+    if [[ ${prod_rc} -ne 8 ]] || [[ "${prod_out}" != *"disabled in production builds"* ]]; then
+        echo "FAIL: production bundle allowed OPSKIT_TEST_MODE=1 (rc=${prod_rc}): ${prod_out}" >&2
+        return 1
+    fi
+    echo "PASS: Non-HTTPS URLs rejected and production bundle locked down against OPSKIT_TEST_MODE=1."
+}
+
+# Test 21: Multi-signature rotation key_id selection and duplicate JSON key rejection
+test_multisig_and_strict_json() {
+    echo "--- Test 21: Multi-signature key rotation and strict duplicate-key JSON rejection ---"
+    local test_dir="${TEST_TEMP_DIR}/multisig"
+    mkdir -p "${test_dir}"
+    cp "${FIXTURE_DIR}/opskit-linux-"* "${test_dir}/"
+
+    local key_old="${TEST_TEMP_DIR}/old.key" key_new="${TEST_TEMP_DIR}/new.key"
+    openssl genpkey -algorithm ed25519 -out "${key_old}" 2>/dev/null
+    openssl genpkey -algorithm ed25519 -out "${key_new}" 2>/dev/null
+    openssl pkey -in "${key_new}" -pubout -out "${test_dir}/release.pub" 2>/dev/null
+    echo "key-new-2026" > "${test_dir}/release.key_id"
+
+    python3 -B -c "
+import json, subprocess, os
+with open('${FIXTURE_DIR}/release-manifest.json', 'r') as f:
+    d = json.load(f)
+d.pop('signatures', None)
+canon = json.dumps(d, separators=(',', ':'), sort_keys=True, ensure_ascii=False).encode('utf-8')
+cf = '${test_dir}/canon.tmp'
+with open(cf, 'wb') as f:
+    f.write(canon)
+sig_old = subprocess.run(['openssl', 'pkeyutl', '-sign', '-inkey', '${key_old}', '-rawin', '-in', cf], stdout=subprocess.PIPE, check=True).stdout.hex()
+sig_new = subprocess.run(['openssl', 'pkeyutl', '-sign', '-inkey', '${key_new}', '-rawin', '-in', cf], stdout=subprocess.PIPE, check=True).stdout.hex()
+os.remove(cf)
+d['signatures'] = [
+    {'key_id': 'key-old-2025', 'algorithm': 'ed25519', 'signature': sig_old},
+    {'key_id': 'key-new-2026', 'algorithm': 'ed25519', 'signature': sig_new}
+]
+with open('${test_dir}/release-manifest.json', 'w') as f:
+    json.dump(d, f)
+"
+    rm -f "${key_old}" "${key_new}"
+
+    local target_bin="${TEST_TEMP_DIR}/opskit_multisig"
+    CLI_INSTALL_PATH="${target_bin}" OPSKIT_ARTIFACT_SOURCE_DIR="${test_dir}" OPSKIT_RELEASE_PUBKEY="${test_dir}/release.pub" OPSKIT_EXPECTED_KEY_ID="key-new-2026" verify_and_install_cli
+    test -x "${target_bin}"
+
+    # Duplicate key JSON must fail canonicalize.py
+    echo '{"a":1,"a":2}' > "${test_dir}/dup.json"
+    if python3 -B "${REPO_ROOT}/lib/canonicalize.py" "${test_dir}/dup.json" >/dev/null 2>&1; then
+        echo "FAIL: canonicalize.py accepted duplicate JSON keys" >&2
+        return 1
+    fi
+    echo "PASS: Multi-signature rotation and strict duplicate-key JSON rejection verified."
+}
+
+test_filename_path_traversal_rejection
+test_path_override_gating
+test_https_enforcement_and_production_bundle
+test_multisig_and_strict_json
+
 echo "ALL MANIFEST ACCEPTANCE TESTS PASSED."

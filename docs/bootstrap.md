@@ -18,7 +18,7 @@ openSUSE Tumbleweed is accepted ungated (rolling release).
 | Operating System | Debian 13+, Ubuntu 24.04+ (incl. 25.x interim), RHEL 9+, Fedora 39+, SLES 15 SP7+, openSUSE Leap 15.6+ / Tumbleweed | `/etc/os-release` parsing | Hard gate failure with distro-specific upgrade guidance |
 | Python 3 Runtime | Python 3 interpreter available | PATH executable lookup | Hard gate: install `python3` via package manager (`apt-get install -y python3`, `dnf install -y python3`, or `zypper install -y python3`) |
 | Linux Kernel | Kernel version >= 5.4 | `uname -r` | Hard gate: upgrade host kernel to enable rootless container namespaces |
-| cgroups v2 | cgroups v2 hierarchy mounted (available controllers recorded in machine plan) | `/sys/fs/cgroup/cgroup.controllers` or `cgroup2` in `/proc/mounts` | Hard gate: mount cgroups v2 hierarchy |
+| cgroups v2 | Unified cgroups v2 hierarchy mounted (available controllers recorded in machine plan) | `/sys/fs/cgroup/cgroup.controllers` | Hard gate: boot with unified cgroups v2 hierarchy |
 | Service Manager | systemd detection (`systemd_running` and user manager recorded) | `/run/systemd/system` or PID 1 process name check | Recorded for unit enablement and reload behavior |
 | Container Runtime | Podman >= 4.4 (for Quadlet support) or rootless Docker | `podman --version` / `docker --version` + rootless socket probe | Hard gate if Podman < 4.4. Pre-installed rootful Docker is converted to rootless via `dockerd-rootless-setuptool.sh` or fails closed; Podman installed if absent |
 | cgroup Delegation | `Delegate=yes` on systemd `user@.service` | `/etc/systemd/system/user@.service.d/` + `DelegateControllers` | Drop-in `opskit-delegate.conf` configured so memory, cpu, and pids limits are enforced |
@@ -26,7 +26,7 @@ openSUSE Tumbleweed is accepted ungated (rolling release).
 | Subordinate IDs | `/etc/subuid` and `/etc/subgid` available | File existence and permissions | Ensure shadow utility files are present and writable |
 | Security Modules | SELinux and AppArmor recorded | `getenforce` / `aa-status` | Recorded for context; security modules are never disabled |
 | Firewall Stack | `nftables`, `firewalld`, `ufw`, or `iptables` | Daemon / tool detection | Active stack identified and recorded; rule fingerprinted |
-| Disk Storage | Free disk space >= 5 GiB on target roots | `df -Pk /var /` | Free up storage on `/var` or root filesystem before continuing |
+| Disk Storage | Free disk space >= 5 GiB on `/var` and distinct `/home` mount | `df -Pk /var /home` | Free up storage on `/var`, `/home`, or root filesystem before continuing |
 | Clock Skew | Clock offset within +-300 seconds (warn > +-60s) | Local clock against monotonic or reference | Synchronize system clock using chrony or systemd-timesyncd |
 | User Linger | User linger support available | `loginctl` command availability | Enable systemd linger for background service execution |
 
@@ -35,7 +35,9 @@ openSUSE Tumbleweed is accepted ungated (rolling release).
 OpsKit runs workloads under an isolated service user account (default: `opskit`).
 
 1. **Pre-existing user audit**: If user `opskit` already exists, `opskit-bootstrap`
-   verifies its configuration rather than assuming suitability.
+   verifies non-zero UID/GID and rejects membership in privileged groups
+   (`docker`, `sudo`, `wheel`, `root`, `adm`, `lxd`, `libvirt`, `disk`, `shadow`)
+   rather than assuming suitability.
 2. **Subuid range reuse**: Existing entries in `/etc/subuid` and `/etc/subgid`
    are preserved. The script inspects allocated ranges and reuses existing
    assignments. If no range is allocated, it assigns a non-overlapping block
@@ -63,9 +65,12 @@ Can this machine accept inbound HTTPS from the public internet on TCP 443? [yes/
     firewalls), `opskit-bootstrap` downgrades the plan to `tunnel` with an
     explicit explanatory notice.
   - In offline environments without external probe services, a local bind
-    audit verifies that port 443 is available, noting that automated ACME
-    TLS-ALPN-01 handshake completion will serve as authoritative reachability
-    verification.
+    audit verifies that TCP 443 (and TCP 80 unless `--no-http` is passed) is
+    not held by a foreign process, noting that automated ACME TLS-ALPN-01
+    handshake completion will serve as authoritative reachability verification.
+    If port 80 is held by an existing web server, `opskit-bootstrap` fails
+    closed before mutating the node and suggests stopping/reconfiguring the
+    service, passing `--no-http`, or selecting `--profile tunnel` / `--profile private`.
 - **Explicit override**: Passing `--profile direct`, `--profile tunnel`, or
   `--profile private` skips intent prompting and honors operator intent. If
   `--profile direct` fails external probing, a warning is issued but the
@@ -107,9 +112,11 @@ if the static CLI binary has already been installed and recorded in the ledger,
 ## Test mode environment variables
 
 `opskit-bootstrap` provides deterministic test hooks for automated container
-acceptance suites. In production execution, all test hook variables are strictly
-rejected with exit code `8` (`VALIDATION_ERROR`) unless `OPSKIT_TEST_MODE=1` is
-explicitly set in the environment.
+acceptance suites. Release bundles built via `scripts/build-release.sh` strip
+test hooks at build time (`OPSKIT_TEST_HOOKS_COMPILED=0`) so `OPSKIT_TEST_MODE=1`
+and all test hook or path-override variables are unconditionally rejected with
+exit code `8` (`VALIDATION_ERROR`). In source checkouts, all test hook and
+path-override variables are rejected unless `OPSKIT_TEST_MODE=1` is set.
 
 Protected test hook variables include:
 - `MOCK_KERNEL_RELEASE`: Overrides kernel release string for version gating tests.

@@ -7,47 +7,29 @@ set -euo pipefail
 rewrite_ledger_profile_and_resign() {
     local new_prof="$1"
     local remove_ids_csv="${2:-}"
-    if [[ ! -f "${LEDGER_FILE}" ]]; then
-        return 0
+    rewrite_chained_ledger "${remove_ids_csv}" "${new_prof}"
+}
+
+_audit_unit_perm_and_dropins() {
+    local unit_path="$1"
+    local mut_id="$2"
+    local unit_name
+    unit_name="$(basename "${unit_path}")"
+    if [[ -f "${unit_path}" ]]; then
+        local mode_owner
+        mode_owner="$(stat -c '%a:%u:%g' "${unit_path}" 2>/dev/null || true)"
+        if [[ "${mode_owner}" != "644:0:0" ]]; then
+            DRIFTED_ITEMS+=("${mut_id}: Permissions/ownership on '${unit_path}' drifted (${mode_owner}, expected 644:0:0)")
+        fi
     fi
-    ensure_canonicalize_helper
-    ensure_ledger_key
-    local tmp_ledger
-    tmp_ledger="$(mktemp "${BOOTSTRAP_STATE_DIR}/.ledger.XXXXXX")"
-    chmod 0600 "${tmp_ledger}"
-    if [[ "${EUID}" -eq 0 ]]; then
-        chown root:root "${tmp_ledger}"
+    local dropin_dir="${unit_path}.d"
+    if [[ -d "${dropin_dir}" ]]; then
+        local f
+        for f in "${dropin_dir}"/*.conf; do
+            [[ -f "${f}" ]] || continue
+            DRIFTED_ITEMS+=("${mut_id}: Unexpected systemd drop-in '${f}' on managed unit '${unit_name}'")
+        done
     fi
-    python3 -B -c "
-import hmac, hashlib, json, sys
-sys.path.insert(0, sys.argv[4])
-from canonicalize import canonical_bytes
-with open(sys.argv[2], 'rb') as kf:
-    key = kf.read().strip()
-new_prof = sys.argv[3]
-remove_ids = {x for x in sys.argv[6].split(',') if x}
-with open(sys.argv[1], 'r') as fin, open(sys.argv[5], 'w') as fout:
-    for line in fin:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        d = json.loads(stripped)
-        if d.get('mutation_id') in remove_ids:
-            continue
-        md = d.get('metadata')
-        if not isinstance(md, dict):
-            md = {}
-            d['metadata'] = md
-        if md.get('profile') != new_prof:
-            md['profile'] = new_prof
-            d.pop('hmac', None)
-            canon = canonical_bytes(d, strip_keys={'hmac'})
-            d['hmac'] = hmac.new(key, canon, hashlib.sha256).hexdigest()
-            fout.write(json.dumps(d, separators=(',', ':')) + '\n')
-        else:
-            fout.write(stripped + '\n')
-" "${LEDGER_FILE}" "${LEDGER_KEY_FILE}" "${new_prof}" "${LIB_DIR}" "${tmp_ledger}" "${remove_ids_csv}"
-    mv -f "${tmp_ledger}" "${LEDGER_FILE}"
 }
 
 perform_profile_transition_cleanup() {
@@ -55,26 +37,31 @@ perform_profile_transition_cleanup() {
     local new_prof="$2"
 
     log_info "Reversing artifacts from '${old_prof}' profile not needed in '${new_prof}' profile..."
-    local user_unit_dir="/home/${SERVICE_USER}/.config/systemd/user"
+    local svc_home user_unit_dir
+    svc_home="$(resolve_service_user_home "${SERVICE_USER}")"
+    user_unit_dir="${svc_home}/.config/systemd/user"
     local remove_ids=()
 
-    # From tunnel -> direct or private: remove cloudflared if recorded in ledger
+    # From tunnel -> direct or private: disable & remove cloudflared if recorded in ledger
     if [[ "${old_prof}" == "tunnel" && "${new_prof}" != "tunnel" ]]; then
         if [[ -f "${LEDGER_FILE}" ]] && grep -q '"mutation_id":"cloudflared_unit"' "${LEDGER_FILE}"; then
             if command -v systemctl >/dev/null 2>&1; then
-                systemctl --user --machine="${SERVICE_USER}@" stop cloudflared.service 2>/dev/null || true
+                systemctl --user --machine="${SERVICE_USER}@" disable --now cloudflared.service 2>/dev/null || true
             fi
-            rm -f "${user_unit_dir}/cloudflared.service"
+            remove_user_file "${user_unit_dir}/cloudflared.service"
             remove_ids+=("cloudflared_unit")
         fi
     fi
 
-    # From any non-direct profile -> direct: stop and remove user-scope opskit-edge.service
+    # From any non-direct profile -> direct: disable & remove user-scope opskit-edge.service
     if [[ "${old_prof}" != "direct" && "${new_prof}" == "direct" ]]; then
         if command -v systemctl >/dev/null 2>&1; then
-            systemctl --user --machine="${SERVICE_USER}@" stop opskit-edge.service 2>/dev/null || true
+            systemctl --user --machine="${SERVICE_USER}@" disable --now opskit-edge.service 2>/dev/null || true
         fi
-        rm -f "${user_unit_dir}/opskit-edge.service"
+        remove_user_file "${user_unit_dir}/opskit-edge.service"
+        if [[ -f "${LEDGER_FILE}" ]] && grep -q '"mutation_id":"service_units"' "${LEDGER_FILE}"; then
+            remove_ids+=("service_units")
+        fi
     fi
 
     # From direct -> tunnel or private: remove socket units, system unit, firewall rules
@@ -85,7 +72,6 @@ perform_profile_transition_cleanup() {
         fi
         rm -f "${SYSTEMD_SYSTEM_DIR}/opskit-edge-443.socket" "${SYSTEMD_SYSTEM_DIR}/opskit-edge-80.socket" "${SYSTEMD_SYSTEM_DIR}/opskit-edge.service"
 
-        # Iterate over ALL recorded firewall_rules entries
         local all_fw_meta_json="" fw_meta_args=()
         if [[ -f "${LEDGER_FILE}" ]]; then
             all_fw_meta_json="$(python3 -B -c "
@@ -120,7 +106,6 @@ with open(sys.argv[1], 'r') as f:
             fi
         fi
 
-        # Fallback to comment-based live removal if tagged OpsKit rules still exist or metadata was absent/unusable
         if family_has_tagged_opskit_firewall_rule 443 tcp || family_has_tagged_opskit_firewall_rule 80 tcp || (command -v nft >/dev/null 2>&1 && nft list chain inet opskit input 2>/dev/null | grep 'comment "opskit-' >/dev/null 2>&1); then
             family_remove_firewall_rule '{"stack":"nftables","port":443,"proto":"tcp"}'
             family_remove_firewall_rule '{"stack":"nftables","port":80,"proto":"tcp"}'
@@ -136,7 +121,6 @@ with open(sys.argv[1], 'r') as f:
             fi
         fi
 
-        # Verification gate via shared survivor helper: refuse if ANY tagged rule (nft/iptables/ufw/firewalld) or colliding nft tag remains
         local surviving_rules=()
         mapfile -t surviving_rules < <(collect_tagged_firewall_survivors --include-nft-collision "${fw_meta_args[@]+"${fw_meta_args[@]}"}")
 
@@ -156,7 +140,6 @@ with open(sys.argv[1], 'r') as f:
         remove_ids+=("edge_socket_units" "edge_system_unit" "firewall_rules")
     fi
 
-    # Atomically strip removed transition entries, update target profile, and re-sign HMACs in one temp-file swap
     local remove_ids_csv=""
     if [[ ${#remove_ids[@]} -gt 0 ]]; then
         remove_ids_csv="$(IFS=,; echo "${remove_ids[*]}")"
@@ -252,6 +235,12 @@ with open(sys.argv[1], 'r') as f:
                 DRIFTED_ITEMS+=("cgroup_delegation: Missing '${cg_dropin}'")
             elif ! file_matches_expected "${cg_dropin}" expected_cgroup_delegate_conf; then
                 DRIFTED_ITEMS+=("cgroup_delegation: Content of '${cg_dropin}' has drifted from expected template")
+            else
+                local cg_mo
+                cg_mo="$(stat -c '%a:%u:%g' "${cg_dropin}" 2>/dev/null || true)"
+                if [[ "${cg_mo}" != "644:0:0" ]]; then
+                    DRIFTED_ITEMS+=("cgroup_delegation: Permissions/ownership on '${cg_dropin}' drifted (${cg_mo}, expected 644:0:0)")
+                fi
             fi
         elif ! has_systemd_delegate_yes; then
             DRIFTED_ITEMS+=("cgroup_delegation: Delegate=yes is no longer active for user@.service")
@@ -275,6 +264,32 @@ with open(sys.argv[1], 'r') as f:
         DRIFTED_ITEMS+=("subuid_allocation: Subordinate GID allocation is missing for '${SERVICE_USER}'")
     fi
 
+    # Determine recorded http_80 posture
+    local recorded_http_80="true"
+    recorded_http_80="$(python3 -B -c "
+import json, sys
+val = 'true'
+with open(sys.argv[1], 'r') as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            d = json.loads(line)
+            if d.get('mutation_id') in ('edge_socket_units', 'edge_system_unit', 'firewall_rules'):
+                md = d.get('metadata', {})
+                if isinstance(md, dict) and 'http_80' in md:
+                    val = 'true' if md['http_80'] else 'false'
+        except Exception:
+            pass
+print(val)
+" "${LEDGER_FILE}" 2>/dev/null || echo true)"
+
+    # Honor explicit --no-http if passed during repair
+    local audit_http_80="${recorded_http_80}"
+    if [[ "${FLAG_NO_HTTP:-false}" == "true" ]]; then
+        audit_http_80="false"
+    fi
+
     # Audit socket units if in ledger
     if grep -q '"mutation_id":"edge_socket_units"' "${LEDGER_FILE}"; then
         local s443="${SYSTEMD_SYSTEM_DIR}/opskit-edge-443.socket"
@@ -283,11 +298,32 @@ with open(sys.argv[1], 'r') as f:
             DRIFTED_ITEMS+=("edge_socket_units: Missing '${s443}'")
         elif ! file_matches_expected "${s443}" expected_edge_443_socket; then
             DRIFTED_ITEMS+=("edge_socket_units: Content of '${s443}' has drifted from expected template")
+        else
+            _audit_unit_perm_and_dropins "${s443}" "edge_socket_units"
         fi
-        if [[ ! -f "${s80}" ]]; then
-            DRIFTED_ITEMS+=("edge_socket_units: Missing '${s80}'")
-        elif ! file_matches_expected "${s80}" expected_edge_80_socket; then
-            DRIFTED_ITEMS+=("edge_socket_units: Content of '${s80}' has drifted from expected template")
+        if [[ "${audit_http_80}" == "true" ]]; then
+            if [[ ! -f "${s80}" ]]; then
+                DRIFTED_ITEMS+=("edge_socket_units: Missing '${s80}'")
+            elif ! file_matches_expected "${s80}" expected_edge_80_socket; then
+                DRIFTED_ITEMS+=("edge_socket_units: Content of '${s80}' has drifted from expected template")
+            else
+                _audit_unit_perm_and_dropins "${s80}" "edge_socket_units"
+            fi
+        fi
+        if [[ "${SYSTEMD_RUNNING:-false}" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+            local check_units=("opskit-edge-443.socket")
+            [[ "${audit_http_80}" == "true" ]] && check_units+=("opskit-edge-80.socket")
+            local su
+            for su in "${check_units[@]}"; do
+                if [[ -f "${SYSTEMD_SYSTEM_DIR}/${su}" ]]; then
+                    if ! systemctl is-enabled --quiet "${su}" 2>/dev/null; then
+                        DRIFTED_ITEMS+=("edge_socket_units: Unit '${su}' is not enabled")
+                    fi
+                    if ! systemctl is-active --quiet "${su}" 2>/dev/null; then
+                        DRIFTED_ITEMS+=("edge_socket_units: Unit '${su}' is not active")
+                    fi
+                fi
+            done
         fi
     fi
 
@@ -298,27 +334,31 @@ with open(sys.argv[1], 'r') as f:
             DRIFTED_ITEMS+=("edge_system_unit: Missing '${esvc}'")
         elif ! file_matches_expected "${esvc}" expected_edge_system_service; then
             DRIFTED_ITEMS+=("edge_system_unit: Content of '${esvc}' has drifted from expected template")
+        else
+            _audit_unit_perm_and_dropins "${esvc}" "edge_system_unit"
         fi
     fi
 
     # Audit firewall rules if in ledger
     if grep -q '"mutation_id":"firewall_rules"' "${LEDGER_FILE}"; then
-        if ! family_has_firewall_rule 443 tcp || ! family_has_firewall_rule 80 tcp; then
+        if ! family_has_firewall_rule 443 tcp; then
+            DRIFTED_ITEMS+=("firewall_rules: Inbound firewall rule for port 443 missing from active stack")
+        elif [[ "${audit_http_80}" == "true" ]] && ! family_has_firewall_rule 80 tcp; then
             DRIFTED_ITEMS+=("firewall_rules: Inbound firewall rules for ports 443/80 missing from active stack")
         fi
     fi
 
-    # Audit user service units if in ledger
-    local user_unit_dir="/home/${SERVICE_USER}/.config/systemd/user"
+    # Audit user service unit if in ledger (tunnel/private only)
+    local svc_home user_unit_dir
+    svc_home="$(resolve_service_user_home "${SERVICE_USER}")"
+    user_unit_dir="${svc_home}/.config/systemd/user"
     if grep -q '"mutation_id":"service_units"' "${LEDGER_FILE}"; then
-        local csvc="${user_unit_dir}/opskit-cloud.service"
         local usvc="${user_unit_dir}/opskit-edge.service"
-        if [[ ! -f "${csvc}" ]]; then
-            DRIFTED_ITEMS+=("service_units: Missing '${csvc}'")
-        elif ! file_matches_expected "${csvc}" expected_user_cloud_service; then
-            DRIFTED_ITEMS+=("service_units: Content of '${csvc}' has drifted from expected template")
-        fi
-        if [[ "${CHOSEN_PROFILE}" != "direct" ]]; then
+        if [[ "${CHOSEN_PROFILE}" == "direct" ]]; then
+            if [[ -f "${usvc}" ]]; then
+                DRIFTED_ITEMS+=("service_units: Stray user-scope '${usvc}' present under direct profile")
+            fi
+        else
             if [[ ! -f "${usvc}" ]]; then
                 DRIFTED_ITEMS+=("service_units: Missing '${usvc}'")
             elif ! file_matches_expected "${usvc}" expected_user_edge_service; then
@@ -392,11 +432,13 @@ repair_configuration() {
     fi
 
     if [[ ! -f "${LEDGER_FILE}" ]]; then
+        if [[ -f "${LEDGER_KEY_FILE}" || -f "${LEDGER_HEAD_FILE}" ]]; then
+            die "${EXIT_VALIDATION_ERROR}" "Cannot repair: ledger '${LEDGER_FILE}' is missing while key or head anchor exists."
+        fi
         cleanup_lock_only_state_dir
         die "${EXIT_NOT_FOUND}" "Cannot repair: no applied mutation ledger found at '${LEDGER_FILE}'."
     fi
 
-    # 1. Pre-lock read-only validation, audit, and interactive confirmation
     if ! validate_entire_ledger; then
         die "${EXIT_VALIDATION_ERROR}" "Cannot repair: ledger integrity verification failed (corrupt or tampered entries)."
     fi
@@ -446,7 +488,6 @@ repair_configuration() {
         fi
     fi
 
-    # 2. Acquire exclusive state lock only after authorization is complete
     ensure_bootstrap_state_dir
     (
         flock -x 201
@@ -456,6 +497,9 @@ repair_configuration() {
 
 _apply_repair_locked() {
     if [[ ! -f "${LEDGER_FILE}" ]]; then
+        if [[ -f "${LEDGER_KEY_FILE}" || -f "${LEDGER_HEAD_FILE}" ]]; then
+            die "${EXIT_VALIDATION_ERROR}" "Cannot repair: ledger '${LEDGER_FILE}' is missing while key or head anchor exists."
+        fi
         cleanup_lock_only_state_dir
         die "${EXIT_NOT_FOUND}" "Cannot repair: no applied mutation ledger found at '${LEDGER_FILE}'."
     fi
@@ -475,6 +519,9 @@ _apply_repair_locked() {
         perform_profile_transition_cleanup "${RECORDED_PROFILE}" "${CHOSEN_PROFILE}"
     fi
     detect_capabilities
+    if [[ "${CHOSEN_PROFILE}" == "direct" ]]; then
+        verify_local_bind
+    fi
     if [[ "${CHOSEN_PROFILE}" == "direct" && "${RECORDED_PROFILE}" == "direct" ]]; then
         local old_fw_meta_args=()
         if [[ -f "${LEDGER_FILE}" ]]; then
@@ -498,7 +545,6 @@ with open(sys.argv[1], 'r') as f:
                 done <<< "${old_fw_raw}"
             fi
         fi
-        # Remove superseded recorded nftables/iptables rules when active FIREWALL_STACK has shifted
         if [[ ${#old_fw_meta_args[@]} -gt 0 ]]; then
             local fw_m superseded_rules=""
             for fw_m in "${old_fw_meta_args[@]}"; do

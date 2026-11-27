@@ -15,6 +15,7 @@ setup_test_artifacts "${TEST_TEMP_DIR}/artifacts"
 export OPSKIT_ARTIFACT_SOURCE_DIR="${TEST_TEMP_DIR}/artifacts"
 export OPSKIT_RELEASE_PUBKEY="${TEST_TEMP_DIR}/artifacts/release.pub"
 export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
+export OPSKIT_SKIP_BIND_CHECK="1"
 
 cleanup() {
     if [[ -n "${PROBE_SERVER_PID:-}" ]]; then

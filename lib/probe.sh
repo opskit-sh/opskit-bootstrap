@@ -88,7 +88,7 @@ resolve_profile() {
         return 0
     fi
 
-    # 5. Direct profile probing
+    # 5. Direct profile probing + mandatory local bind verification
     if [[ -n "${FLAG_NO_PROBE:-}" ]]; then
         PROBE_STATUS="skipped"
         PROBE_DETAILS="Probe skipped by --no-probe flag; local bind verification only."
@@ -96,36 +96,91 @@ resolve_profile() {
         return 0
     fi
 
-    # External probe if probe server available
     local probe_url="${OPSKIT_PROBE_SERVER:-}"
     if [[ -n "${probe_url}" ]]; then
         perform_external_probe "${probe_url}"
+        if [[ "${CHOSEN_PROFILE}" == "direct" ]]; then
+            verify_local_bind
+        fi
     else
-        # Open-edition / offline path: local bind test plus ACME handshake proof notice
         verify_local_bind
         PROBE_STATUS="verified_local"
         PROBE_DETAILS="Port 443 local bind available. Authoritative reachability will be confirmed via ACME TLS-ALPN-01."
     fi
 }
 
+# Verify that required direct-profile TCP ports (443, and 80 unless --no-http)
+# are not bound by a foreign process (e.g., nginx/apache/caddy).
 verify_local_bind() {
-    # Verify port 443 is not already bound by a foreign process
-    if command -v ss >/dev/null 2>&1; then
-        if ss -tlpn 2>/dev/null | grep -E ':(443)\s' >/dev/null 2>&1; then
-            local occupant
-            occupant="$(ss -tlpn 2>/dev/null | grep -E ':(443)\s' | head -n1)"
-            if [[ ! "${occupant}" =~ (opskit|systemd) ]]; then
-                die "${EXIT_CONFLICT}" "Port 443 is already in use by a foreign service: ${occupant}."
+    if [[ "${OPSKIT_TEST_HOOKS_COMPILED}" == "1" && "${OPSKIT_TEST_MODE:-0}" == "1" && "${OPSKIT_SKIP_BIND_CHECK:-0}" == "1" ]]; then
+        return 0
+    fi
+
+    local ports=(443)
+    if [[ "${FLAG_NO_HTTP:-false}" != "true" ]]; then
+        ports+=(80)
+    fi
+
+    local p
+    for p in "${ports[@]}"; do
+        # Skip if OpsKit's own systemd socket unit is already actively holding this port.
+        if [[ "${SYSTEMD_RUNNING:-false}" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+            if systemctl is-active --quiet "opskit-edge-${p}.socket" 2>/dev/null; then
+                continue
             fi
         fi
-    fi
+
+        local occupant=""
+        if command -v ss >/dev/null 2>&1; then
+            occupant="$(ss -Htlpn 2>/dev/null | awk -v port="${p}" '
+                {
+                    addr = $4
+                    if (addr ~ ("(^|:|\\])" port "$")) {
+                        print $0
+                        exit
+                    }
+                }
+            ' || true)"
+        elif [[ -r /proc/net/tcp || -r /proc/net/tcp6 ]]; then
+            local hex_port
+            hex_port="$(printf '%04X' "${p}")"
+            occupant="$(awk -v hp="${hex_port}" '
+                NR > 1 {
+                    split($2, a, ":")
+                    if (toupper(a[2]) == hp && $4 == "0A") {
+                        print $2
+                        exit
+                    }
+                }
+            ' /proc/net/tcp /proc/net/tcp6 2>/dev/null || true)"
+        fi
+
+        if [[ -n "${occupant}" ]]; then
+            if [[ "${occupant}" == *"opskit-edge"* ]]; then
+                continue
+            fi
+            local proc_desc="unknown process (run with sudo to identify)"
+            if [[ "${occupant}" == *"users:("* ]]; then
+                proc_desc="$(sed -n 's/.*users:((\([^)]*\)).*/\1/p' <<< "${occupant}")"
+                [[ -z "${proc_desc}" ]] && proc_desc="${occupant}"
+            fi
+            if [[ "${p}" == "80" ]]; then
+                die "${EXIT_CONFLICT}" "Port 80 is already in use by a foreign service (${proc_desc}). Stop or reconfigure that service, re-run with --no-http to bind only TCP 443 (ACME TLS-ALPN-01), or choose --profile tunnel / --profile private."
+            else
+                die "${EXIT_CONFLICT}" "Port 443 is already in use by a foreign service (${proc_desc}). Stop or reconfigure that service to free TCP 443, or choose --profile tunnel / --profile private."
+            fi
+        fi
+    done
 }
 
 perform_external_probe() {
     local probe_endpoint="$1"
+    validate_remote_url "${probe_endpoint}" "probe server URL"
+    set_curl_proto_flags "${probe_endpoint}"
+
     log_info "Probing inbound TCP 443 reachability via ${probe_endpoint}..."
 
-    local probe_curl_flags=(-s -S --max-time 10)
+    local probe_curl_flags=(-s -S --max-time 10 "${CURL_PROTO_FLAGS[@]}" --max-filesize 65536)
     [[ -n "${FLAG_PROXY:-}" ]] && probe_curl_flags+=(--proxy "${FLAG_PROXY}")
     [[ -n "${FLAG_CACERT:-}" ]] && probe_curl_flags+=(--cacert "${FLAG_CACERT}")
 

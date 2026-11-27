@@ -439,12 +439,12 @@ export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
 
 # 2. Simulate killed mid-apply on edge_socket_units:
 # Delete the edge_socket_units ledger entry from apply.jsonl, but leave socket units on disk
-python3 -B -c "
-with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"r\") as f:
-    lines = [l for l in f if \"edge_socket_units\" not in l]
-with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"w\") as f:
-    f.writelines(lines)
-"
+(
+    LIB_DIR="/bootstrap/lib"
+    source "${LIB_DIR}/common.sh"
+    source "${LIB_DIR}/ledger.sh"
+    rewrite_chained_ledger "edge_socket_units" ""
+)
 
 test -f /etc/systemd/system/opskit-edge-443.socket
 
@@ -556,12 +556,12 @@ export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
 id opskit >/dev/null
 
 # 2. Simulate crash window: delete service_user line from ledger
-python3 -B -c "
-with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"r\") as f:
-    lines = [l for l in f if \"service_user\" not in l]
-with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"w\") as f:
-    f.writelines(lines)
-"
+(
+    LIB_DIR="/bootstrap/lib"
+    source "${LIB_DIR}/common.sh"
+    source "${LIB_DIR}/ledger.sh"
+    rewrite_chained_ledger "service_user" ""
+)
 if grep -q "\"mutation_id\":\"service_user\"" /var/lib/opskit-bootstrap/apply.jsonl; then
     echo "FAIL: service_user unexpectedly still present in ledger" >&2
     exit 1
@@ -637,12 +637,12 @@ if nft list table inet opskit 2>/dev/null; then
 fi
 
 # 4. Unledgered cloudflared unit is preserved across transitions
-python3 -B -c "
-with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"r\") as f:
-    lines = [l for l in f if \"cloudflared_unit\" not in l]
-with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"w\") as f:
-    f.writelines(lines)
-"
+(
+    LIB_DIR="/bootstrap/lib"
+    source "${LIB_DIR}/common.sh"
+    source "${LIB_DIR}/ledger.sh"
+    rewrite_chained_ledger "cloudflared_unit" ""
+)
 echo "# custom unledgered unit" > /home/opskit/.config/systemd/user/cloudflared.service
 
 # Transition to direct via repair
@@ -773,12 +773,12 @@ export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
 test -f /usr/local/bin/opskit
 
 # 2. Simulate missing fetch_cli entry from ledger
-python3 -B -c "
-with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"r\") as f:
-    lines = [l for l in f if \"fetch_cli\" not in l]
-with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"w\") as f:
-    f.writelines(lines)
-"
+(
+    LIB_DIR="/bootstrap/lib"
+    source "${LIB_DIR}/common.sh"
+    source "${LIB_DIR}/ledger.sh"
+    rewrite_chained_ledger "fetch_cli" ""
+)
 if grep -q "\"mutation_id\":\"fetch_cli\"" /var/lib/opskit-bootstrap/apply.jsonl; then
     echo "FAIL: fetch_cli unexpectedly still present before reconciliation test" >&2
     exit 1
@@ -972,12 +972,12 @@ export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
 nft list table inet opskit >/dev/null
 
 # 2. Simulate crash window: delete firewall_rules entry from ledger while rules stay live
-python3 -B -c "
-with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"r\") as f:
-    lines = [l for l in f if \"firewall_rules\" not in l]
-with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"w\") as f:
-    f.writelines(lines)
-"
+(
+    LIB_DIR="/bootstrap/lib"
+    source "${LIB_DIR}/common.sh"
+    source "${LIB_DIR}/ledger.sh"
+    rewrite_chained_ledger "firewall_rules" ""
+)
 if grep -q "\"mutation_id\":\"firewall_rules\"" /var/lib/opskit-bootstrap/apply.jsonl; then
     echo "FAIL: firewall_rules unexpectedly present before Test 22 transition" >&2
     exit 1
@@ -1066,28 +1066,24 @@ export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
 /bootstrap/bin/opskit-bootstrap --profile direct --no-probe --yes >/dev/null
 nft list table inet opskit >/dev/null
 
-# 2. Modify firewall_rules entry to have empty metadata: {} with valid HMAC
+# 2. Modify firewall_rules entry to have empty metadata: {} with valid chained HMAC
 python3 -B -c "
-import hmac, hashlib, json, sys
-sys.path.insert(0, \"/bootstrap/lib\")
-from canonicalize import canonical_bytes
-
-with open(\"/var/lib/opskit-bootstrap/ledger.key\", \"rb\") as f:
-    key = f.read().strip()
-
+import json
 with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"r\") as f:
     entries = [json.loads(l) for l in f if l.strip()]
-
 for e in entries:
     if e.get(\"mutation_id\") == \"firewall_rules\":
         e[\"metadata\"] = {}
-        e.pop(\"hmac\", None)
-        e[\"hmac\"] = hmac.new(key, canonical_bytes(e, strip_keys={\"hmac\"}), hashlib.sha256).hexdigest()
-
 with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"w\") as f:
     for e in entries:
         f.write(json.dumps(e, separators=(\",\", \":\")) + \"\n\")
 "
+(
+    LIB_DIR="/bootstrap/lib"
+    source "${LIB_DIR}/common.sh"
+    source "${LIB_DIR}/ledger.sh"
+    rewrite_chained_ledger "" ""
+)
 
 # 3. Transition direct -> tunnel via repair
 /bootstrap/bin/opskit-bootstrap --repair --profile tunnel --yes >/dev/null
@@ -1336,7 +1332,7 @@ rm -f "$(command -v nft)"
 /bootstrap/bin/opskit-bootstrap --profile direct --no-probe --yes >/dev/null
 iptables -S INPUT | grep -q "opskit-443"
 
-# Simulate stale metadata claiming stack=nftables with valid HMAC
+# Simulate stale metadata claiming stack=nftables with valid chained HMAC + ledger.head
 python3 -B -c "
 import hmac, hashlib, json, sys
 sys.path.insert(0, \"/bootstrap/lib\")
@@ -1345,15 +1341,24 @@ with open(\"/var/lib/opskit-bootstrap/ledger.key\", \"rb\") as f:
     key = f.read().strip()
 with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"r\") as f:
     entries = [json.loads(l) for l in f if l.strip()]
-for e in entries:
+prev = \"genesis\"
+for idx, e in enumerate(entries, start=1):
     if e.get(\"mutation_id\") == \"firewall_rules\":
         e[\"metadata\"][\"rule443\"][\"stack\"] = \"nftables\"
         e[\"metadata\"][\"rule80\"][\"stack\"] = \"nftables\"
-        e.pop(\"hmac\", None)
-        e[\"hmac\"] = hmac.new(key, canonical_bytes(e, strip_keys={\"hmac\"}), hashlib.sha256).hexdigest()
+    e[\"seq\"] = idx
+    e[\"prev_hmac\"] = prev
+    e.pop(\"hmac\", None)
+    sig = hmac.new(key, canonical_bytes(e, strip_keys={\"hmac\"}), hashlib.sha256).hexdigest()
+    e[\"hmac\"] = sig
+    prev = sig
 with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"w\") as f:
     for e in entries:
         f.write(json.dumps(e, separators=(\",\", \":\")) + \"\n\")
+head_obj = {\"count\": len(entries), \"head_hmac\": prev}
+head_obj[\"mac\"] = hmac.new(key, canonical_bytes(head_obj), hashlib.sha256).hexdigest()
+with open(\"/var/lib/opskit-bootstrap/ledger.head\", \"w\") as hf:
+    hf.write(json.dumps(head_obj, separators=(\",\", \":\")) + \"\n\")
 "
 
 /var/lib/opskit-bootstrap/opskit-bootstrap --undo --yes >/dev/null
@@ -1602,14 +1607,17 @@ test -f /var/lib/opskit-bootstrap/ledger.key
 test ! -f /etc/systemd/system/opskit-edge.service
 nft list chain inet opskit input | grep "opskit-443" >/dev/null
 
-# Clear block and retry --undo cleanly
+# Clear block and retry --undo cleanly (and follow-up --purge)
 rm -f /usr/local/sbin/nft
 /var/lib/opskit-bootstrap/opskit-bootstrap --undo --yes >/dev/null
-test ! -d /var/lib/opskit-bootstrap
+test -f /var/lib/opskit-bootstrap/apply.jsonl
+! grep -q "\"mutation_id\":\"firewall_rules\"" /var/lib/opskit-bootstrap/apply.jsonl
 if nft list table inet opskit >/dev/null 2>&1; then
     echo "FAIL: inet opskit table survived successful retry undo" >&2
     exit 1
 fi
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
+test ! -d /var/lib/opskit-bootstrap
 echo "PASS: Undo tagged survivor retained state dir on exit 6 and succeeded on retry."
 '
 }
@@ -1973,6 +1981,8 @@ ufw --force enable >/dev/null
 ufw allow 8443/tcp comment "opskit-443-legacy" >/dev/null
 /bootstrap/bin/opskit-bootstrap --profile direct --no-probe --yes >/dev/null
 /var/lib/opskit-bootstrap/opskit-bootstrap --undo --yes >/dev/null
+! grep -q "\"mutation_id\":\"firewall_rules\"" /var/lib/opskit-bootstrap/apply.jsonl
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
 test ! -d /var/lib/opskit-bootstrap
 ufw status | grep -qE "^8443/tcp[[:space:]]+ALLOW.*# opskit-443-legacy"
 
@@ -2011,7 +2021,7 @@ if grep -q "^ENABLED=yes" /etc/ufw/ufw.conf && [[ -x /usr/lib/ufw/ufw-init ]]; t
     /usr/lib/ufw/ufw-init start quiet
 fi
 /var/lib/opskit-bootstrap/opskit-bootstrap --undo --yes >/dev/null
-test ! -d /var/lib/opskit-bootstrap
+! grep -q "\"mutation_id\":\"firewall_rules\"" /var/lib/opskit-bootstrap/apply.jsonl
 if grep -qE "comment=6f70736b69742d(343433|3830)([[:space:]]|$)" /etc/ufw/user.rules /etc/ufw/user6.rules; then
     echo "FAIL: opskit-443/80 tuples survived reinstall + retry undo" >&2
     exit 1
@@ -2109,6 +2119,8 @@ grep "\"mutation_id\":\"firewall_rules\"" /var/lib/opskit-bootstrap/apply.jsonl 
 
 # Undo from ufw-disabled state still succeeds cleanly and leaves zero resurrection
 /var/lib/opskit-bootstrap/opskit-bootstrap --undo --yes >/dev/null
+! grep -q "\"mutation_id\":\"firewall_rules\"" /var/lib/opskit-bootstrap/apply.jsonl
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
 test ! -d /var/lib/opskit-bootstrap
 ufw --force enable >/dev/null
 if ufw status | grep -qE "^(443|80)(/tcp)?[[:space:]]"; then
@@ -2141,25 +2153,26 @@ test "${p8_undo_rc}" -eq 6
 echo "${p8_undo_out}" | grep -q "ufw:443/tcp"
 test -f /var/lib/opskit-bootstrap/apply.jsonl
 
-# Subcase 3: overwrite firewall_rules metadata to {} with valid HMAC while ufw binary is removed -> undo STILL exits 6
+# Subcase 3: overwrite firewall_rules metadata to {} with valid chained HMAC while ufw binary is removed -> undo STILL exits 6
 cp /var/lib/opskit-bootstrap/apply.jsonl /tmp/apply.removed.bak
+cp /var/lib/opskit-bootstrap/ledger.head /tmp/head.removed.bak
 python3 -B -c "
-import hmac, hashlib, json, sys
-sys.path.insert(0, \"/bootstrap/lib\")
-from canonicalize import canonical_bytes
-with open(\"/var/lib/opskit-bootstrap/ledger.key\", \"rb\") as f:
-    key = f.read().strip()
+import json
 with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"r\") as f:
     entries = [json.loads(l) for l in f if l.strip()]
 for e in entries:
     if e.get(\"mutation_id\") == \"firewall_rules\":
         e[\"metadata\"] = {}
-        e.pop(\"hmac\", None)
-        e[\"hmac\"] = hmac.new(key, canonical_bytes(e, strip_keys={\"hmac\"}), hashlib.sha256).hexdigest()
 with open(\"/var/lib/opskit-bootstrap/apply.jsonl\", \"w\") as f:
     for e in entries:
         f.write(json.dumps(e, separators=(\",\", \":\")) + \"\n\")
 "
+(
+    LIB_DIR="/bootstrap/lib"
+    source "${LIB_DIR}/common.sh"
+    source "${LIB_DIR}/ledger.sh"
+    rewrite_chained_ledger "" ""
+)
 set +e
 p2_undo_out="$(/var/lib/opskit-bootstrap/opskit-bootstrap --undo --yes 2>&1)"
 p2_undo_rc=$?
@@ -2169,6 +2182,7 @@ echo "${p2_undo_out}" | grep -q "ufw:443/tcp"
 echo "${p2_undo_out}" | grep -q "ufw:80/tcp"
 test -f /var/lib/opskit-bootstrap/apply.jsonl
 mv /tmp/apply.removed.bak /var/lib/opskit-bootstrap/apply.jsonl
+mv /tmp/head.removed.bak /var/lib/opskit-bootstrap/ledger.head
 
 # Subcase 4: trailing-space hex comment=...20 + malformed metadata fallback
 LIB_DIR="/bootstrap/lib"
@@ -2188,6 +2202,8 @@ if grep -q "^ENABLED=yes" /etc/ufw/ufw.conf && [[ -x /usr/lib/ufw/ufw-init ]]; t
     /usr/lib/ufw/ufw-init start quiet
 fi
 /var/lib/opskit-bootstrap/opskit-bootstrap --undo --yes >/dev/null
+! grep -q "\"mutation_id\":\"firewall_rules\"" /var/lib/opskit-bootstrap/apply.jsonl
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
 test ! -d /var/lib/opskit-bootstrap
 ufw --force enable >/dev/null
 if ufw status | grep -qE "^(443|80)(/tcp)?[[:space:]]"; then
@@ -2406,6 +2422,8 @@ echo "${drift_out}" | grep -q "firewall_rules:"
 ufw disable >/dev/null
 /bootstrap/bin/opskit-bootstrap --repair --profile tunnel --yes >/dev/null
 /var/lib/opskit-bootstrap/opskit-bootstrap --undo --yes >/dev/null
+! grep -q "\"mutation_id\":\"cloudflared_unit\"" /var/lib/opskit-bootstrap/apply.jsonl
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
 test ! -d /var/lib/opskit-bootstrap
 echo "PASS: Admin firewalld XML ignored when another stack owns node; strict active-stack check caught mid-life ufw."
 '
@@ -2664,5 +2682,167 @@ test_preexisting_user_preserved_on_purge
 test_firewalld_isolation_active_stack_and_minimal_rhel
 test_profile_state_integrity_cli_digest_drift_and_plan_hash
 test_repair_refusal_superseded_fw_and_ownership_edges
+
+# Test 44: Symlink-following privesc defense in /home/opskit/.config/systemd/user
+test_user_home_symlink_privesc_defense() {
+    echo "--- Test 44: Symlink-following privilege escalation defense in service user home ---"
+    podman run --rm --privileged -v "${REPO_ROOT}:/bootstrap:ro" -v "${TEST_ARTIFACTS_DIR}:/artifacts:ro" localhost/opskit-test-debian:13 /bin/bash -c '
+set -euo pipefail
+export OPSKIT_TEST_MODE="1"
+export MOCK_KERNEL_RELEASE="6.1.0-28-amd64"
+export MOCK_DISK_FREE_GB="50"
+export OPSKIT_SKIP_DISK_CHECK="1"
+export OPSKIT_ARTIFACT_SOURCE_DIR="/artifacts"
+export OPSKIT_RELEASE_PUBKEY="/artifacts/release.pub"
+export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
+
+/bootstrap/bin/opskit-bootstrap --profile tunnel --no-probe --yes >/dev/null
+
+# Plant a root-owned canary file and replace user-owned unit with a symlink to it
+echo "ROOT_CANARY_INTACT" > /etc/opskit-canary
+chmod 0600 /etc/opskit-canary
+chown root:root /etc/opskit-canary
+
+rm -f /home/opskit/.config/systemd/user/opskit-edge.service
+ln -s /etc/opskit-canary /home/opskit/.config/systemd/user/opskit-edge.service
+chown -h opskit:opskit /home/opskit/.config/systemd/user/opskit-edge.service
+
+# Re-run --repair and --undo --yes: neither may overwrite or chown /etc/opskit-canary
+/bootstrap/bin/opskit-bootstrap --repair --yes >/dev/null
+test "$(< /etc/opskit-canary)" = "ROOT_CANARY_INTACT"
+test "$(stat -c "%a:%u:%g" /etc/opskit-canary)" = "600:0:0"
+
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --yes >/dev/null
+test -f /etc/opskit-canary
+test "$(< /etc/opskit-canary)" = "ROOT_CANARY_INTACT"
+test "$(stat -c "%a:%u:%g" /etc/opskit-canary)" = "600:0:0"
+
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
+test -f /etc/opskit-canary
+echo "PASS: Root never followed symlink in service user home across repair and undo."
+'
+}
+
+# Test 45: Port 80 conflict pre-bind refusal, --no-http, unit hardening, socket directives, and versions/current layout
+test_port80_conflict_no_http_and_unit_hardening() {
+    echo "--- Test 45: Port 80 conflict abort, --no-http, unit hardening, and versions layout ---"
+    podman run --rm --privileged -v "${REPO_ROOT}:/bootstrap:ro" -v "${TEST_ARTIFACTS_DIR}:/artifacts:ro" localhost/opskit-test-debian:13 /bin/bash -c '
+set -euo pipefail
+export OPSKIT_TEST_MODE="1"
+export MOCK_KERNEL_RELEASE="6.1.0-28-amd64"
+export MOCK_DISK_FREE_GB="50"
+export OPSKIT_SKIP_DISK_CHECK="1"
+export OPSKIT_ARTIFACT_SOURCE_DIR="/artifacts"
+export OPSKIT_RELEASE_PUBKEY="/artifacts/release.pub"
+export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
+
+# 1. Start a foreign TCP listener on :80
+python3 -B -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((\"0.0.0.0\", 80))
+s.listen(5)
+time.sleep(30)
+" &
+PORT80_PID=$!
+trap "kill ${PORT80_PID} 2>/dev/null || true" EXIT
+sleep 0.3
+
+# Direct without --no-http must fail with exit 4 BEFORE mutating user or state dir
+set +e
+c_out="$(/bootstrap/bin/opskit-bootstrap --profile direct --no-probe --yes 2>&1)"
+c_rc=$?
+set -e
+test "${c_rc}" -eq 4
+echo "${c_out}" | grep -q "Port 80 is already in use"
+echo "${c_out}" | grep -q -- "--no-http"
+! id opskit >/dev/null 2>&1
+test ! -e /var/lib/opskit-bootstrap
+
+# 2. Direct with --no-http succeeds with :443 only
+/bootstrap/bin/opskit-bootstrap --profile direct --no-probe --no-http --yes >/dev/null
+test -f /etc/systemd/system/opskit-edge-443.socket
+test ! -f /etc/systemd/system/opskit-edge-80.socket
+test -f /etc/systemd/system/opskit-edge.service
+test ! -f /home/opskit/.config/systemd/user/opskit-cloud.service
+
+# Verify socket unit fixes
+grep -q "BindIPv6Only=ipv6-only" /etc/systemd/system/opskit-edge-443.socket
+grep -q "NonBlocking=true" /etc/systemd/system/opskit-edge-443.socket
+! grep -q "PartOf=" /etc/systemd/system/opskit-edge-443.socket
+! grep -q "SocketMode=" /etc/systemd/system/opskit-edge-443.socket
+
+# Verify hardened opskit-edge.service directives
+svc="/etc/systemd/system/opskit-edge.service"
+grep -q "Requires=opskit-edge-443.socket" "${svc}"
+! grep -q "opskit-edge-80.socket" "${svc}"
+grep -q "NoNewPrivileges=yes" "${svc}"
+grep -q "ProtectSystem=strict" "${svc}"
+grep -q "PrivateTmp=yes" "${svc}"
+grep -q "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" "${svc}"
+grep -q "UMask=0027" "${svc}"
+! grep -q "NonBlocking=true" "${svc}"
+
+# Verify versions/current is NOT created as a directory
+test -d /var/lib/opskit/versions
+test ! -d /var/lib/opskit/versions/current
+
+# Verify unit SHA-256 fingerprints recorded in apply.jsonl
+grep "\"mutation_id\":\"edge_system_unit\"" /var/lib/opskit-bootstrap/apply.jsonl | grep -q "\"after_fingerprint\":\"sha256:"
+grep "\"mutation_id\":\"edge_socket_units\"" /var/lib/opskit-bootstrap/apply.jsonl | grep -q "\"after_fingerprint\":\"sha256:"
+
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
+echo "PASS: Port 80 conflict gate, --no-http, unit hardening, socket directives, and versions layout verified."
+'
+}
+
+# Test 46: Repair detects unit permission drift and unexpected systemd .d/ drop-ins
+test_repair_detects_unit_perms_and_dropins() {
+    echo "--- Test 46: Repair detects unit permission drift and .d/ drop-ins ---"
+    podman run --rm --privileged -v "${REPO_ROOT}:/bootstrap:ro" -v "${TEST_ARTIFACTS_DIR}:/artifacts:ro" localhost/opskit-test-debian:13 /bin/bash -c '
+set -euo pipefail
+export OPSKIT_TEST_MODE="1"
+export MOCK_KERNEL_RELEASE="6.1.0-28-amd64"
+export MOCK_DISK_FREE_GB="50"
+export OPSKIT_SKIP_DISK_CHECK="1"
+export OPSKIT_ARTIFACT_SOURCE_DIR="/artifacts"
+export OPSKIT_RELEASE_PUBKEY="/artifacts/release.pub"
+export OPSKIT_EXPECTED_KEY_ID="test-release-key-1"
+
+/bootstrap/bin/opskit-bootstrap --profile direct --no-probe --yes >/dev/null
+
+# Drift 1: permission change on opskit-edge.service
+chmod 0600 /etc/systemd/system/opskit-edge.service
+set +e
+perm_out="$(/bootstrap/bin/opskit-bootstrap --repair 2>&1)"
+perm_rc=$?
+set -e
+test "${perm_rc}" -eq 5
+echo "${perm_out}" | grep -q "Permissions/ownership"
+
+# Repair fixes permission
+/bootstrap/bin/opskit-bootstrap --repair --yes >/dev/null
+test "$(stat -c "%a:%u:%g" /etc/systemd/system/opskit-edge.service)" = "644:0:0"
+
+# Drift 2: unexpected drop-in under opskit-edge.service.d
+mkdir -p /etc/systemd/system/opskit-edge.service.d
+printf "[Service]\nUser=root\n" > /etc/systemd/system/opskit-edge.service.d/override.conf
+set +e
+drop_out="$(/bootstrap/bin/opskit-bootstrap --repair 2>&1)"
+drop_rc=$?
+set -e
+test "${drop_rc}" -eq 5
+echo "${drop_out}" | grep -q "Unexpected systemd drop-in"
+
+rm -rf /etc/systemd/system/opskit-edge.service.d
+/var/lib/opskit-bootstrap/opskit-bootstrap --undo --purge --yes >/dev/null
+echo "PASS: Repair detected unit permission drift and unexpected systemd .d/ drop-in."
+'
+}
+
+test_user_home_symlink_privesc_defense
+test_port80_conflict_no_http_and_unit_hardening
+test_repair_detects_unit_perms_and_dropins
 
 echo "ALL OS MATRIX ACCEPTANCE TESTS PASSED."

@@ -21,6 +21,9 @@ apply_mutations() {
         return 0
     fi
 
+    # Vendor uninstaller and state directory BEFORE any mutation so partial failures remain reversible
+    vendor_uninstaller
+
     log_info "Applying approved bootstrap plan (${PLAN_HASH})..."
 
     # 1. Packages
@@ -40,7 +43,7 @@ apply_mutations() {
                 pkgs+=("${rd_pkg}")
             done
         fi
-        if [[ ${#pkgs[@]} -eq 0 ]] && [[ "${OPSKIT_TEST_MODE:-0}" == "1" && "${OPSKIT_TEST_FORCE_PACKAGES:-0}" == "1" ]]; then
+        if [[ ${#pkgs[@]} -eq 0 ]] && [[ "${OPSKIT_TEST_HOOKS_COMPILED}" == "1" && "${OPSKIT_TEST_MODE:-0}" == "1" && "${OPSKIT_TEST_FORCE_PACKAGES:-0}" == "1" ]]; then
             case "${DETECTED_FAMILY}" in
                 debian) pkgs=("podman" "uidmap") ;;
                 rhel) pkgs=("podman" "shadow-utils") ;;
@@ -73,18 +76,16 @@ apply_mutations() {
             u_uid="$(id -u "${SERVICE_USER}")"
             u_gid="$(id -g "${SERVICE_USER}")"
             user_created_by_opskit=true
-            record_mutation "service_user" "H" "absent" "present:uid=${u_uid}:gid=${u_gid}" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"group\":\"${SERVICE_GROUP}\",\"created\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+            record_mutation "service_user" "H" "absent" "present:uid=${u_uid}:gid=${u_gid}" "${PLAN_HASH}" "{\"user\":\"$(json_escape "${SERVICE_USER}")\",\"group\":\"$(json_escape "${SERVICE_GROUP}")\",\"created\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
         elif [[ -f "/etc/sysusers.d/${SERVICE_USER}.conf" ]]; then
-            # Crash-window reconciliation: user exists with OpsKit sysusers.d drop-in marker
             u_uid="$(id -u "${SERVICE_USER}")"
             u_gid="$(id -g "${SERVICE_USER}")"
             user_created_by_opskit=true
-            record_mutation "service_user" "H" "absent" "present:uid=${u_uid}:gid=${u_gid}" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"group\":\"${SERVICE_GROUP}\",\"created\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+            record_mutation "service_user" "H" "absent" "present:uid=${u_uid}:gid=${u_gid}" "${PLAN_HASH}" "{\"user\":\"$(json_escape "${SERVICE_USER}")\",\"group\":\"$(json_escape "${SERVICE_GROUP}")\",\"created\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
         else
-            # Pre-existing admin user without OpsKit sysusers.d marker: record and never purge
             u_uid="$(id -u "${SERVICE_USER}")"
             u_gid="$(id -g "${SERVICE_USER}")"
-            record_mutation "service_user" "H" "present:uid=${u_uid}:gid=${u_gid}" "present:uid=${u_uid}:gid=${u_gid}" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"group\":\"${SERVICE_GROUP}\",\"created\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+            record_mutation "service_user" "H" "present:uid=${u_uid}:gid=${u_gid}" "present:uid=${u_uid}:gid=${u_gid}" "${PLAN_HASH}" "{\"user\":\"$(json_escape "${SERVICE_USER}")\",\"group\":\"$(json_escape "${SERVICE_GROUP}")\",\"created\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
             log_info "Recorded pre-existing service account '${SERVICE_USER}' (uid=${u_uid}, preserved on purge)."
         fi
     fi
@@ -102,34 +103,53 @@ apply_mutations() {
     # 4. User linger (anchor ownership to pre-apply LINGER_ACTIVE verdict)
     if is_mutation_planned "user_linger"; then
         if ${LINGER_ACTIVE:-false} && ! ${pre_apply_sysusers_marker}; then
-            record_mutation "user_linger" "H" "present:enabled" "enabled" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"enabled\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+            record_mutation "user_linger" "H" "present:enabled" "enabled" "${PLAN_HASH}" "{\"user\":\"$(json_escape "${SERVICE_USER}")\",\"enabled\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
             log_info "Recorded pre-existing systemd user linger for '${SERVICE_USER}' (preserved on purge)."
         elif [[ -f "/var/lib/systemd/linger/${SERVICE_USER}" && ! -f "/etc/sysusers.d/${SERVICE_USER}.conf" ]] && ! ${user_created_by_opskit}; then
-            record_mutation "user_linger" "H" "present:enabled" "enabled" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"enabled\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+            record_mutation "user_linger" "H" "present:enabled" "enabled" "${PLAN_HASH}" "{\"user\":\"$(json_escape "${SERVICE_USER}")\",\"enabled\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
             log_info "Recorded pre-existing systemd user linger for '${SERVICE_USER}' (preserved on purge)."
         else
             log_info "Enabling systemd user linger for '${SERVICE_USER}'..."
-            if command -v loginctl >/dev/null 2>&1; then
+            if ${SYSTEMD_RUNNING} && [[ -S /run/dbus/system_bus_socket ]] && command -v loginctl >/dev/null 2>&1; then
+                loginctl enable-linger "${SERVICE_USER}" || die "${EXIT_RUNTIME_ERROR}" "Failed to enable systemd user linger for '${SERVICE_USER}'."
+            elif command -v loginctl >/dev/null 2>&1; then
                 loginctl enable-linger "${SERVICE_USER}" 2>/dev/null || true
             fi
             mkdir -p /var/lib/systemd/linger
             touch "/var/lib/systemd/linger/${SERVICE_USER}"
-            record_mutation "user_linger" "H" "disabled" "enabled" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"enabled\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+            record_mutation "user_linger" "H" "disabled" "enabled" "${PLAN_HASH}" "{\"user\":\"$(json_escape "${SERVICE_USER}")\",\"enabled\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
         fi
     fi
 
-    # Create service state directories
-    mkdir -p "${SERVICE_STATE_DIR}"/{edge,versions/current,logs,state}
-    chmod 0750 "${SERVICE_STATE_DIR}"
+    # Create service state directory non-recursively (never create versions/current as a directory)
+    ensure_safe_dir_no_symlink "${SERVICE_STATE_DIR}"
+    if [[ ! -d "${SERVICE_STATE_DIR}" ]]; then
+        mkdir -p "${SERVICE_STATE_DIR}"
+        chmod 0750 "${SERVICE_STATE_DIR}"
+        if id "${SERVICE_USER}" >/dev/null 2>&1; then
+            chown "${SERVICE_USER}:${SERVICE_GROUP}" "${SERVICE_STATE_DIR}"
+        fi
+    fi
     if id "${SERVICE_USER}" >/dev/null 2>&1; then
-        chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${SERVICE_STATE_DIR}"
+        run_as_service_user '
+            set -eu
+            for d in "$@"; do
+                mkdir -p "$d"
+                chmod 0750 "$d"
+            done
+        ' "${SERVICE_STATE_DIR}/edge" "${SERVICE_STATE_DIR}/versions" "${SERVICE_STATE_DIR}/logs" "${SERVICE_STATE_DIR}/state"
     fi
 
-    # User systemd config directory
-    local user_systemd_dir="/home/${SERVICE_USER}/.config/systemd/user"
-    mkdir -p "${user_systemd_dir}"
+    # User systemd config directory (created strictly as SERVICE_USER)
+    local svc_home user_systemd_dir
+    svc_home="$(resolve_service_user_home "${SERVICE_USER}")"
+    user_systemd_dir="${svc_home}/.config/systemd/user"
     if id "${SERVICE_USER}" >/dev/null 2>&1; then
-        chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "/home/${SERVICE_USER}/.config"
+        run_as_service_user '
+            set -eu
+            mkdir -p "$1"
+            chmod 0755 "$1"
+        ' "${user_systemd_dir}"
     fi
 
     # 4b. Rootless Docker provisioning (when Docker is selected)
@@ -137,15 +157,17 @@ apply_mutations() {
         provision_rootless_docker
     fi
 
-    # 5. Direct profile: root socket units & system unit & firewall
+    # 5. Direct profile: system edge unit FIRST, then socket units, then firewall rules
     if [[ "${CHOSEN_PROFILE}" == "direct" ]]; then
-        is_mutation_planned "edge_socket_units" && install_edge_socket_units
         is_mutation_planned "edge_system_unit" && install_edge_system_unit
+        is_mutation_planned "edge_socket_units" && install_edge_socket_units
         is_mutation_planned "firewall_rules" && install_firewall_rules
     fi
 
-    # 8. Service units
-    is_mutation_planned "service_units" && install_user_units "${user_systemd_dir}"
+    # 8. User exposure unit (tunnel/private profiles only)
+    if [[ "${CHOSEN_PROFILE}" != "direct" ]]; then
+        is_mutation_planned "service_units" && install_user_units "${user_systemd_dir}"
+    fi
 
     # 9. Tunnel profile: cloudflared user unit template
     if [[ "${CHOSEN_PROFILE}" == "tunnel" ]]; then
@@ -167,9 +189,6 @@ apply_mutations() {
 
     # 12. Fail-closed runtime and cgroup delegation verification
     verify_rootless_runtime_and_delegation
-
-    # Vendor uninstaller and state
-    vendor_uninstaller
 
     log_info "Bootstrap completed successfully under '${CHOSEN_PROFILE}' profile."
 }
@@ -225,15 +244,14 @@ print('false:false')
         fi
         if ${subuid_owned} && ${subgid_owned}; then
             alloc_all=true
-            record_mutation "subuid_allocation" "H" "none" "${existing_subuid}" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"range\":\"${existing_subuid}\",\"allocated\":true,\"subuid_allocated\":true,\"subgid_allocated\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+            record_mutation "subuid_allocation" "H" "none" "${existing_subuid}" "${PLAN_HASH}" "{\"user\":\"$(json_escape "${SERVICE_USER}")\",\"range\":\"$(json_escape "${existing_subuid}")\",\"allocated\":true,\"subuid_allocated\":true,\"subgid_allocated\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
         else
-            record_mutation "subuid_allocation" "H" "present:${existing_subuid}" "${existing_subuid}" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"range\":\"${existing_subuid}\",\"allocated\":${alloc_all},\"subuid_allocated\":${subuid_owned},\"subgid_allocated\":${subgid_owned},\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+            record_mutation "subuid_allocation" "H" "present:${existing_subuid}" "${existing_subuid}" "${PLAN_HASH}" "{\"user\":\"$(json_escape "${SERVICE_USER}")\",\"range\":\"$(json_escape "${existing_subuid}")\",\"allocated\":${alloc_all},\"subuid_allocated\":${subuid_owned},\"subgid_allocated\":${subgid_owned},\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
             log_info "Recorded existing subuid/subgid range ${existing_subuid} for '${SERVICE_USER}' (subuid_owned=${subuid_owned}, subgid_owned=${subgid_owned})."
         fi
         return 0
     fi
 
-    # Determine range to write for any missing file (reuse single-file entry or compute max across both files)
     local target_range="${existing_subuid:-${existing_subgid}}"
     local before_fp="none"
     if [[ -n "${target_range}" ]]; then
@@ -244,7 +262,7 @@ print('false:false')
         for f in "${SUBUID_FILE}" "${SUBGID_FILE}"; do
             if [[ -s "${f}" ]]; then
                 while IFS=: read -r _ start count; do
-                    if [[ -n "${start}" && "${start}" =~ ^[0-9]+$ ]]; then
+                    if [[ -n "${start}" && "${start}" =~ ^[0-9]+$ && "${count:-65536}" =~ ^[0-9]+$ ]]; then
                         local end=$(( start + ${count:-65536} ))
                         if [[ ${end} -gt ${max_uid} ]]; then
                             max_uid=${end}
@@ -255,6 +273,9 @@ print('false:false')
         done
         local new_start="${OPSKIT_SUBUID_START:-${max_uid}}"
         local count="${OPSKIT_SUBUID_COUNT:-65536}"
+        if [[ ! "${new_start}" =~ ^[0-9]+$ || ! "${count}" =~ ^[0-9]+$ || "${count}" -le 0 || $(( new_start + count )) -gt 4294967295 ]]; then
+            die "${EXIT_VALIDATION_ERROR}" "Calculated subordinate UID/GID range (${new_start}:${count}) exceeds 32-bit UID space."
+        fi
         target_range="${new_start}:${count}"
     fi
 
@@ -276,48 +297,103 @@ print('false:false')
     if ${subuid_added} && ${subgid_added}; then
         alloc_flag=true
     fi
-    record_mutation "subuid_allocation" "H" "${before_fp}" "${target_range}" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"range\":\"${target_range}\",\"allocated\":${alloc_flag},\"subuid_allocated\":${subuid_added},\"subgid_allocated\":${subgid_added},\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+    record_mutation "subuid_allocation" "H" "${before_fp}" "${target_range}" "${PLAN_HASH}" "{\"user\":\"$(json_escape "${SERVICE_USER}")\",\"range\":\"$(json_escape "${target_range}")\",\"allocated\":${alloc_flag},\"subuid_allocated\":${subuid_added},\"subgid_allocated\":${subgid_added},\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
     log_info "Configured subuid/subgid range ${target_range} for '${SERVICE_USER}' (subuid_owned=${subuid_added}, subgid_owned=${subgid_added})."
-}
-
-install_edge_socket_units() {
-    mkdir -p "${SYSTEMD_SYSTEM_DIR}"
-
-    expected_edge_443_socket > "${SYSTEMD_SYSTEM_DIR}/opskit-edge-443.socket"
-    expected_edge_80_socket > "${SYSTEMD_SYSTEM_DIR}/opskit-edge-80.socket"
-
-    chmod 0644 "${SYSTEMD_SYSTEM_DIR}/opskit-edge-"*.socket
-    chown root:root "${SYSTEMD_SYSTEM_DIR}/opskit-edge-"*.socket
-
-    if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
-        systemctl daemon-reload
-        systemctl enable --now opskit-edge-443.socket opskit-edge-80.socket
-        systemctl is-active --quiet opskit-edge-443.socket || die "${EXIT_RUNTIME_ERROR}" "opskit-edge-443.socket failed to activate"
-        systemctl is-active --quiet opskit-edge-80.socket || die "${EXIT_RUNTIME_ERROR}" "opskit-edge-80.socket failed to activate"
-    fi
-
-    record_mutation "edge_socket_units" "H" "absent" "installed" "${PLAN_HASH}" "{\"units\":[\"opskit-edge-443.socket\",\"opskit-edge-80.socket\"],\"profile\":\"direct\"}"
-    log_info "Installed root-owned socket units for ports 443 and 80."
 }
 
 install_edge_system_unit() {
     mkdir -p "${SYSTEMD_SYSTEM_DIR}"
+    local svc_path="${SYSTEMD_SYSTEM_DIR}/opskit-edge.service"
+    local before_fp="absent"
+    if [[ -f "${svc_path}" ]]; then
+        before_fp="sha256:$(compute_sha256 "${svc_path}")"
+    fi
 
-    expected_edge_system_service > "${SYSTEMD_SYSTEM_DIR}/opskit-edge.service"
-
-    chmod 0644 "${SYSTEMD_SYSTEM_DIR}/opskit-edge.service"
-    chown root:root "${SYSTEMD_SYSTEM_DIR}/opskit-edge.service"
+    expected_edge_system_service > "${svc_path}"
+    chmod 0644 "${svc_path}"
+    chown root:root "${svc_path}"
 
     if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload
     fi
 
-    record_mutation "edge_system_unit" "H" "absent" "installed" "${PLAN_HASH}" "{\"unit\":\"opskit-edge.service\",\"profile\":\"direct\"}"
-    log_info "Installed root-owned edge service unit with User=${SERVICE_USER}."
+    local unit_sha
+    unit_sha="$(compute_sha256 "${svc_path}")"
+    local http_80_bool="true"
+    [[ "${FLAG_NO_HTTP:-false}" == "true" ]] && http_80_bool="false"
+    record_mutation "edge_system_unit" "H" "${before_fp}" "sha256:${unit_sha}" "${PLAN_HASH}" "{\"unit\":\"opskit-edge.service\",\"sha256\":\"${unit_sha}\",\"http_80\":${http_80_bool},\"profile\":\"direct\"}"
+    log_info "Installed root-owned hardened edge service unit with User=${SERVICE_USER}."
+}
+
+install_edge_socket_units() {
+    mkdir -p "${SYSTEMD_SYSTEM_DIR}"
+    local s443="${SYSTEMD_SYSTEM_DIR}/opskit-edge-443.socket"
+    local s80="${SYSTEMD_SYSTEM_DIR}/opskit-edge-80.socket"
+
+    local before_443="absent" before_80="absent"
+    [[ -f "${s443}" ]] && before_443="$(compute_sha256 "${s443}")"
+    [[ -f "${s80}" ]] && before_80="$(compute_sha256 "${s80}")"
+    local before_fp="absent"
+    if [[ "${before_443}" != "absent" || "${before_80}" != "absent" ]]; then
+        before_fp="sha256:$(compute_sha256 "${before_443}:${before_80}")"
+    fi
+
+    expected_edge_443_socket > "${s443}"
+    chmod 0644 "${s443}"
+    chown root:root "${s443}"
+
+    local active_units=("opskit-edge-443.socket")
+    local http_80_bool="true"
+    if [[ "${FLAG_NO_HTTP:-false}" == "true" ]]; then
+        http_80_bool="false"
+        if [[ -f "${s80}" ]]; then
+            if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
+                systemctl disable --now opskit-edge-80.socket 2>/dev/null || true
+            fi
+            rm -f "${s80}"
+        fi
+    else
+        expected_edge_80_socket > "${s80}"
+        chmod 0644 "${s80}"
+        chown root:root "${s80}"
+        active_units+=("opskit-edge-80.socket")
+    fi
+
+    if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload
+        systemctl enable --now "${active_units[@]}"
+        local u
+        for u in "${active_units[@]}"; do
+            systemctl is-active --quiet "${u}" || die "${EXIT_RUNTIME_ERROR}" "${u} failed to activate"
+        done
+    fi
+
+    local sha443 sha80="absent" combined_sha units_json sha_map_json
+    sha443="$(compute_sha256 "${s443}")"
+    if [[ "${http_80_bool}" == "true" ]]; then
+        sha80="$(compute_sha256 "${s80}")"
+        combined_sha="$(compute_sha256 "${sha443}:${sha80}")"
+        units_json='["opskit-edge-443.socket","opskit-edge-80.socket"]'
+        sha_map_json="{\"opskit-edge-443.socket\":\"${sha443}\",\"opskit-edge-80.socket\":\"${sha80}\"}"
+    else
+        combined_sha="${sha443}"
+        units_json='["opskit-edge-443.socket"]'
+        sha_map_json="{\"opskit-edge-443.socket\":\"${sha443}\"}"
+    fi
+
+    record_mutation "edge_socket_units" "H" "${before_fp}" "sha256:${combined_sha}" "${PLAN_HASH}" "{\"units\":${units_json},\"unit_sha256\":${sha_map_json},\"http_80\":${http_80_bool},\"profile\":\"direct\"}"
+    log_info "Installed root-owned socket unit(s): ${active_units[*]}."
 }
 
 install_firewall_rules() {
-    log_info "Applying firewall allowances for ports 443 and 80 in ${FIREWALL_STACK}..."
+    local http_80_bool="true"
+    [[ "${FLAG_NO_HTTP:-false}" == "true" ]] && http_80_bool="false"
+    if [[ "${http_80_bool}" == "true" ]]; then
+        log_info "Applying firewall allowances for ports 443 and 80 in ${FIREWALL_STACK}..."
+    else
+        log_info "Applying firewall allowance for port 443 in ${FIREWALL_STACK}..."
+    fi
+
     local prior_r443_owned="false" prior_r80_owned="false"
     if [[ -f "${LEDGER_FILE}" ]]; then
         local prior_owned
@@ -345,38 +421,42 @@ print(f'{r443}:{r80}')
 " "${LEDGER_FILE}" 2>/dev/null || echo "false:false")"
         IFS=: read -r prior_r443_owned prior_r80_owned <<< "${prior_owned}"
     fi
+
+    local pre_fw_fp="absent"
+    if [[ "${FIREWALL_STACK}" == "nftables" ]] && command -v nft >/dev/null 2>&1; then
+        pre_fw_fp="sha256:$(compute_sha256 "$(nft list table inet opskit 2>/dev/null || echo none)")"
+    elif [[ "${FIREWALL_STACK}" == "iptables" ]] && command -v iptables >/dev/null 2>&1; then
+        pre_fw_fp="sha256:$(compute_sha256 "$(iptables -S INPUT 2>/dev/null || echo none)")"
+    elif [[ "${FIREWALL_STACK}" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
+        pre_fw_fp="sha256:$(compute_sha256 "$(ufw status 2>/dev/null || echo none)")"
+    elif [[ "${FIREWALL_STACK}" == "firewalld" ]] && command -v firewall-cmd >/dev/null 2>&1; then
+        pre_fw_fp="sha256:$(compute_sha256 "$(firewall-cmd --list-ports 2>/dev/null || echo none)")"
+    fi
+
     local rule443 rule80
     rule443="$(family_apply_firewall_rule 443 tcp "${prior_r443_owned}")"
-    rule80="$(family_apply_firewall_rule 80 tcp "${prior_r80_owned}")"
-
-    record_mutation "firewall_rules" "H" "default" "allowed:443,80" "${PLAN_HASH}" "{\"rule443\":${rule443},\"rule80\":${rule80},\"profile\":\"direct\"}"
+    if [[ "${http_80_bool}" == "true" ]]; then
+        rule80="$(family_apply_firewall_rule 80 tcp "${prior_r80_owned}")"
+        record_mutation "firewall_rules" "H" "${pre_fw_fp}" "allowed:443,80" "${PLAN_HASH}" "{\"rule443\":${rule443},\"rule80\":${rule80},\"http_80\":true,\"profile\":\"direct\"}"
+    else
+        record_mutation "firewall_rules" "H" "${pre_fw_fp}" "allowed:443" "${PLAN_HASH}" "{\"rule443\":${rule443},\"http_80\":false,\"profile\":\"direct\"}"
+    fi
 }
 
 install_user_units() {
     local target_dir="$1"
-
-    expected_user_cloud_service > "${target_dir}/opskit-cloud.service"
-
-    if [[ "${CHOSEN_PROFILE}" != "direct" ]]; then
-        expected_user_edge_service > "${target_dir}/opskit-edge.service"
-    fi
-
-    chmod 0644 "${target_dir}/opskit-"*.service
-    if id "${SERVICE_USER}" >/dev/null 2>&1; then
-        chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${target_dir}"
-    fi
-
-    record_mutation "service_units" "U" "absent" "installed" "${PLAN_HASH}" "{\"directory\":\"${target_dir}\",\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+    expected_user_edge_service | write_user_file "${target_dir}/opskit-edge.service" 0644
+    local unit_sha
+    unit_sha="$(compute_sha256 "${target_dir}/opskit-edge.service")"
+    record_mutation "service_units" "U" "absent" "sha256:${unit_sha}" "${PLAN_HASH}" "{\"directory\":\"$(json_escape "${target_dir}")\",\"unit\":\"opskit-edge.service\",\"sha256\":\"${unit_sha}\",\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
 }
 
 install_cloudflared_unit() {
     local target_dir="$1"
-    expected_user_cloudflared_service > "${target_dir}/cloudflared.service"
-    chmod 0644 "${target_dir}/cloudflared.service"
-    if id "${SERVICE_USER}" >/dev/null 2>&1; then
-        chown "${SERVICE_USER}:${SERVICE_GROUP}" "${target_dir}/cloudflared.service"
-    fi
-    record_mutation "cloudflared_unit" "U" "absent" "installed" "${PLAN_HASH}" "{\"unit\":\"cloudflared.service\",\"profile\":\"tunnel\"}"
+    expected_user_cloudflared_service | write_user_file "${target_dir}/cloudflared.service" 0644
+    local unit_sha
+    unit_sha="$(compute_sha256 "${target_dir}/cloudflared.service")"
+    record_mutation "cloudflared_unit" "U" "absent" "sha256:${unit_sha}" "${PLAN_HASH}" "{\"unit\":\"cloudflared.service\",\"sha256\":\"${unit_sha}\",\"profile\":\"tunnel\"}"
 }
 
 apply_security_labels() {
@@ -397,7 +477,6 @@ apply_cgroup_delegation() {
         svc_uid="$(id -u "${SERVICE_USER}")"
     fi
 
-    # Check if an administrator already configured Delegate=yes outside OpsKit's drop-in
     if [[ ! -f "${dropin_file}" ]] && has_systemd_delegate_yes "${svc_uid}"; then
         if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload 2>/dev/null || true
@@ -409,7 +488,7 @@ apply_cgroup_delegation() {
                 fi
             fi
         fi
-        record_mutation "cgroup_delegation" "H" "present:admin" "present:delegate=yes" "${PLAN_HASH}" "{\"dropin\":\"${dropin_file}\",\"created\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+        record_mutation "cgroup_delegation" "H" "present:admin" "present:delegate=yes" "${PLAN_HASH}" "{\"dropin\":\"$(json_escape "${dropin_file}")\",\"created\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
         log_info "Recorded pre-existing systemd cgroup delegation configuration (preserved on purge)."
         return 0
     fi
@@ -429,7 +508,7 @@ apply_cgroup_delegation() {
         fi
     fi
 
-    record_mutation "cgroup_delegation" "H" "absent" "present:delegate=yes" "${PLAN_HASH}" "{\"dropin\":\"${dropin_file}\",\"created\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+    record_mutation "cgroup_delegation" "H" "absent" "present:delegate=yes" "${PLAN_HASH}" "{\"dropin\":\"$(json_escape "${dropin_file}")\",\"created\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
     log_info "Configured systemd cgroup v2 delegation (Delegate=yes) at '${dropin_file}'."
 }
 
@@ -439,21 +518,20 @@ provision_rootless_docker() {
     if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
         die "${EXIT_VALIDATION_ERROR}" "Cannot provision rootless Docker: service user '${SERVICE_USER}' does not exist."
     fi
-    local svc_uid
+    local svc_uid svc_home
     svc_uid="$(id -u "${SERVICE_USER}")"
-    local docker_env_dir="/home/${SERVICE_USER}/.config/environment.d"
+    svc_home="$(resolve_service_user_home "${SERVICE_USER}")"
+    local docker_env_dir="${svc_home}/.config/environment.d"
     local docker_env_file="${docker_env_dir}/opskit-docker.conf"
 
     if ${DOCKER_ROOTLESS_USABLE:-false}; then
         local existing_sock
         existing_sock="$(resolve_service_user_docker_socket "${SERVICE_USER}")"
         if [[ ! -f "${docker_env_file}" ]] && ! grep -qhE '^[[:space:]]*DOCKER_HOST=' "${docker_env_dir}"/*.conf 2>/dev/null; then
-            mkdir -p "${docker_env_dir}"
-            printf 'DOCKER_HOST=unix://%s\n' "${existing_sock:-/run/user/${svc_uid}/docker.sock}" > "${docker_env_file}"
-            chmod 0644 "${docker_env_file}"
-            chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${docker_env_dir}"
+            printf 'DOCKER_HOST=unix://%s\n' "${existing_sock:-/run/user/${svc_uid}/docker.sock}" | write_user_file "${docker_env_file}" 0644
         fi
-        record_mutation "rootless_docker" "U" "present:rootless" "present:rootless" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"socket\":\"${existing_sock:-/run/user/${svc_uid}/docker.sock}\",\"env_file\":\"${docker_env_file}\",\"created\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+        local eff_sock="${existing_sock:-/run/user/${svc_uid}/docker.sock}"
+        record_mutation "rootless_docker" "U" "present:rootless" "present:rootless" "${PLAN_HASH}" "{\"user\":\"$(json_escape "${SERVICE_USER}")\",\"socket\":\"$(json_escape "${eff_sock}")\",\"env_file\":\"$(json_escape "${docker_env_file}")\",\"created\":false,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
         log_info "Recorded pre-existing rootless Docker setup for '${SERVICE_USER}' (preserved on purge)."
         return 0
     fi
@@ -468,7 +546,6 @@ provision_rootless_docker() {
         die "${EXIT_VALIDATION_ERROR}" "Cannot convert pre-installed Docker to rootless mode: subordinate UID/GID mapping missing for '${SERVICE_USER}'."
     fi
 
-    # Wait briefly for loginctl enable-linger to populate /run/user/<uid> when systemd + dbus are running
     if ${SYSTEMD_RUNNING} && [[ -S /run/dbus/system_bus_socket ]]; then
         local wait_i=0
         while [[ ! -d "/run/user/${svc_uid}" && ${wait_i} -lt 10 ]]; do
@@ -478,16 +555,16 @@ provision_rootless_docker() {
     fi
 
     log_info "Provisioning rootless Docker for '${SERVICE_USER}' via dockerd-rootless-setuptool.sh..."
-    local xdg_rt_export=""
-    if [[ -d "/run/user/${svc_uid}" ]]; then
-        xdg_rt_export="export XDG_RUNTIME_DIR='/run/user/${svc_uid}' DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/${svc_uid}/bus'"
-    fi
     local setup_out="" setup_rc=0
-    setup_out="$(su -s /bin/bash "${SERVICE_USER}" -c "
-        export HOME='/home/${SERVICE_USER}'
-        ${xdg_rt_export}
+    setup_out="$(run_as_service_user '
+        set -eu
+        export HOME="$1"
+        if [ -d "$2" ]; then
+            export XDG_RUNTIME_DIR="$2"
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$2/bus"
+        fi
         dockerd-rootless-setuptool.sh install
-    " 201>&- 2>&1)" || setup_rc=$?
+    ' "${svc_home}" "/run/user/${svc_uid}" 2>&1)" || setup_rc=$?
 
     if [[ ${setup_rc} -ne 0 ]]; then
         die "${EXIT_RUNTIME_ERROR}" "Rootless Docker provisioning failed for '${SERVICE_USER}' (exit ${setup_rc}): ${setup_out}"
@@ -496,17 +573,14 @@ provision_rootless_docker() {
     # Persist DOCKER_HOST in systemd user environment.d
     # Upstream environment.d(5): https://www.freedesktop.org/software/systemd/man/latest/environment.d.html
     local rootless_sock="/run/user/${svc_uid}/docker.sock"
-    if [[ ! -d "/run/user/${svc_uid}" && -d "/home/${SERVICE_USER}/.docker/run" ]]; then
-        rootless_sock="/home/${SERVICE_USER}/.docker/run/docker.sock"
+    if [[ ! -d "/run/user/${svc_uid}" && -d "${svc_home}/.docker/run" ]]; then
+        rootless_sock="${svc_home}/.docker/run/docker.sock"
     fi
-    mkdir -p "${docker_env_dir}"
-    printf 'DOCKER_HOST=unix://%s\n' "${rootless_sock}" > "${docker_env_file}"
-    chmod 0644 "${docker_env_file}"
-    chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${docker_env_dir}"
+    printf 'DOCKER_HOST=unix://%s\n' "${rootless_sock}" | write_user_file "${docker_env_file}" 0644
 
     if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
         systemctl --user --machine="${SERVICE_USER}@" set-environment "DOCKER_HOST=unix://${rootless_sock}" 2>/dev/null || true
-        if [[ -f "/home/${SERVICE_USER}/.config/systemd/user/docker.service" ]]; then
+        if [[ -f "${svc_home}/.config/systemd/user/docker.service" ]]; then
             systemctl --user --machine="${SERVICE_USER}@" start docker.service 2>/dev/null || true
         fi
     fi
@@ -517,7 +591,7 @@ provision_rootless_docker() {
         sock_wait=$((sock_wait + 1))
     done
 
-    record_mutation "rootless_docker" "U" "absent" "present:rootless" "${PLAN_HASH}" "{\"user\":\"${SERVICE_USER}\",\"socket\":\"${rootless_sock}\",\"env_file\":\"${docker_env_file}\",\"created\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
+    record_mutation "rootless_docker" "U" "absent" "present:rootless" "${PLAN_HASH}" "{\"user\":\"$(json_escape "${SERVICE_USER}")\",\"socket\":\"$(json_escape "${rootless_sock}")\",\"env_file\":\"$(json_escape "${docker_env_file}")\",\"created\":true,\"profile\":\"$(json_escape "${CHOSEN_PROFILE}")\"}"
     log_info "Provisioned rootless Docker for '${SERVICE_USER}' at '${rootless_sock}'."
 }
 
@@ -525,24 +599,30 @@ verify_rootless_runtime_and_delegation() {
     if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
         die "${EXIT_RUNTIME_ERROR}" "Runtime verification failed: service user '${SERVICE_USER}' does not exist."
     fi
-    local svc_uid
+    local svc_uid svc_home
     svc_uid="$(id -u "${SERVICE_USER}")"
+    svc_home="$(resolve_service_user_home "${SERVICE_USER}")"
 
     # 1. Verify cgroup delegation configuration and active systemd user delegation
     if ! has_systemd_delegate_yes "${svc_uid}"; then
         die "${EXIT_RUNTIME_ERROR}" "Cgroup delegation verification failed: Delegate=yes is not configured for user@.service."
     fi
     if ${SYSTEMD_RUNNING} && command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl is-active --quiet "user@${svc_uid}.service" 2>/dev/null && [[ -S /run/dbus/system_bus_socket ]]; then
+            systemctl start "user@${svc_uid}.service" 2>/dev/null || true
+        fi
         if systemctl is-active --quiet "user@${svc_uid}.service" 2>/dev/null; then
             local del_ctrls=""
             del_ctrls="$(systemctl show "user@${svc_uid}.service" -p DelegateControllers --value 2>/dev/null || true)"
             if [[ "${del_ctrls}" != *"memory"* || "${del_ctrls}" != *"cpu"* || "${del_ctrls}" != *"pids"* ]]; then
                 die "${EXIT_RUNTIME_ERROR}" "Cgroup delegation verification failed: user@${svc_uid}.service DelegateControllers='${del_ctrls}' lacks required memory/cpu/pids controllers."
             fi
+        elif [[ -S /run/dbus/system_bus_socket ]]; then
+            die "${EXIT_RUNTIME_ERROR}" "Cgroup delegation verification failed: user@${svc_uid}.service is inactive under systemd."
         fi
     fi
 
-    # 2. Verify chosen runtime is rootless-functional as SERVICE_USER (and memory limit enforced when an image is present)
+    # 2. Verify chosen runtime is rootless-functional as SERVICE_USER
     if [[ "${DETECTED_RUNTIME}" == "docker" ]]; then
         local sock
         sock="$(resolve_service_user_docker_socket "${SERVICE_USER}")"
@@ -550,25 +630,32 @@ verify_rootless_runtime_and_delegation() {
             die "${EXIT_RUNTIME_ERROR}" "Rootless Docker verification failed: rootless socket '${sock:-<unset>}' for '${SERVICE_USER}' does not exist. Cannot fall back to rootful /var/run/docker.sock."
         fi
         local sec_opts=""
-        sec_opts="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' DOCKER_HOST='unix://${sock}' docker info --format '{{.SecurityOptions}}'" 201>&- 2>/dev/null || true)"
+        sec_opts="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" DOCKER_HOST="unix://$3" docker info --format "{{.SecurityOptions}}"' "${svc_home}" "/run/user/${svc_uid}" "${sock}" 2>/dev/null || true)"
         if [[ "${sec_opts}" != *"rootless"* ]]; then
             die "${EXIT_RUNTIME_ERROR}" "Rootless Docker verification failed: 'docker info' as '${SERVICE_USER}' on '${sock}' did not report rootless mode (SecurityOptions='${sec_opts}')."
         fi
 
         local verify_img="${OPSKIT_VERIFY_IMAGE:-}"
+        local explicit_verify_img=false
+        [[ -n "${verify_img}" ]] && explicit_verify_img=true
         if [[ -z "${verify_img}" ]]; then
-            verify_img="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' DOCKER_HOST='unix://${sock}' docker images -q 2>/dev/null | head -n1" 201>&- || true)"
+            verify_img="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" DOCKER_HOST="unix://$3" docker images -q 2>/dev/null | head -n1' "${svc_home}" "/run/user/${svc_uid}" "${sock}" 2>/dev/null || true)"
         fi
         if [[ -n "${verify_img}" ]]; then
+            if [[ ! "${verify_img}" =~ ^[A-Za-z0-9._:/@-]+$ ]]; then
+                die "${EXIT_VALIDATION_ERROR}" "Invalid container image identifier '${verify_img}'."
+            fi
             local mem_out=""
-            mem_out="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' DOCKER_HOST='unix://${sock}' docker run --rm --network none --memory 33554432 '${verify_img}' sh -c 'cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null'" 201>&- 2>/dev/null | tr -d '[:space:]' || true)"
-            if [[ ! "${mem_out}" =~ ^[0-9]+$ ]] || [[ "${mem_out}" -gt 33554432 ]]; then
-                die "${EXIT_RUNTIME_ERROR}" "Rootless Docker cgroup memory limit verification failed (expected <= 33554432, got '${mem_out:-empty}')."
+            mem_out="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" DOCKER_HOST="unix://$3" docker run --rm --network none --memory 33554432 --entrypoint "" "$4" /bin/sh -c "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null"' "${svc_home}" "/run/user/${svc_uid}" "${sock}" "${verify_img}" 2>/dev/null | tr -d '[:space:]' || true)"
+            if [[ -n "${mem_out}" || ${explicit_verify_img} == true ]]; then
+                if [[ ! "${mem_out}" =~ ^[0-9]+$ ]] || [[ "${mem_out}" -gt 33554432 ]]; then
+                    die "${EXIT_RUNTIME_ERROR}" "Rootless Docker cgroup memory limit verification failed (expected <= 33554432, got '${mem_out:-empty}')."
+                fi
             fi
         fi
         log_info "Verified rootless Docker functionality and cgroup delegation for '${SERVICE_USER}'."
     elif [[ "${DETECTED_RUNTIME}" == "podman" ]]; then
-        if [[ "${OPSKIT_TEST_MODE:-0}" == "1" ]] && ! ${SYSTEMD_RUNNING} && [[ "${OPSKIT_FORCE_RUNTIME_VERIFY:-0}" != "1" ]]; then
+        if [[ "${OPSKIT_TEST_HOOKS_COMPILED}" == "1" && "${OPSKIT_TEST_MODE:-0}" == "1" ]] && ! ${SYSTEMD_RUNNING} && [[ "${OPSKIT_FORCE_RUNTIME_VERIFY:-0}" != "1" ]]; then
             command -v podman >/dev/null 2>&1 || die "${EXIT_RUNTIME_ERROR}" "Podman binary not found after bootstrap."
             command -v newuidmap >/dev/null 2>&1 || die "${EXIT_RUNTIME_ERROR}" "newuidmap not found after bootstrap."
             log_info "Verified cgroup delegation config and Podman prerequisites for '${SERVICE_USER}' (container test mode without systemd PID 1)."
@@ -576,23 +663,38 @@ verify_rootless_runtime_and_delegation() {
         fi
         local rootless_flag=""
         local podman_extra=""
-        rootless_flag="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' podman info --format '{{.Host.Security.Rootless}}'" 201>&- 2>/dev/null | tr -d '[:space:]' || true)"
-        if [[ "${rootless_flag}" != "true" && "${OPSKIT_TEST_MODE:-0}" == "1" ]]; then
+        rootless_flag="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman info --format "{{.Host.Security.Rootless}}"' "${svc_home}" "/run/user/${svc_uid}" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ "${rootless_flag}" != "true" && "${OPSKIT_TEST_HOOKS_COMPILED}" == "1" && "${OPSKIT_TEST_MODE:-0}" == "1" ]]; then
             podman_extra="--storage-driver vfs"
-            rootless_flag="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' podman ${podman_extra} info --format '{{.Host.Security.Rootless}}'" 201>&- 2>/dev/null | tr -d '[:space:]' || true)"
+            rootless_flag="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman --storage-driver vfs info --format "{{.Host.Security.Rootless}}"' "${svc_home}" "/run/user/${svc_uid}" 2>/dev/null | tr -d '[:space:]' || true)"
         fi
         if [[ "${rootless_flag}" != "true" ]]; then
             die "${EXIT_RUNTIME_ERROR}" "Rootless Podman verification failed for '${SERVICE_USER}' (Rootless='${rootless_flag}')."
         fi
         local verify_img="${OPSKIT_VERIFY_IMAGE:-}"
+        local explicit_verify_img=false
+        [[ -n "${verify_img}" ]] && explicit_verify_img=true
         if [[ -z "${verify_img}" ]]; then
-            verify_img="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' podman ${podman_extra} images -q 2>/dev/null | head -n1" 201>&- || true)"
+            if [[ -n "${podman_extra}" ]]; then
+                verify_img="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman --storage-driver vfs images -q 2>/dev/null | head -n1' "${svc_home}" "/run/user/${svc_uid}" 2>/dev/null || true)"
+            else
+                verify_img="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman images -q 2>/dev/null | head -n1' "${svc_home}" "/run/user/${svc_uid}" 2>/dev/null || true)"
+            fi
         fi
         if [[ -n "${verify_img}" ]]; then
+            if [[ ! "${verify_img}" =~ ^[A-Za-z0-9._:/@-]+$ ]]; then
+                die "${EXIT_VALIDATION_ERROR}" "Invalid container image identifier '${verify_img}'."
+            fi
             local mem_out=""
-            mem_out="$(su -s /bin/sh "${SERVICE_USER}" -c "HOME='/home/${SERVICE_USER}' XDG_RUNTIME_DIR='/run/user/${svc_uid}' podman ${podman_extra} run --rm --network none --memory 33554432 '${verify_img}' sh -c 'cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null'" 201>&- 2>/dev/null | tr -d '[:space:]' || true)"
-            if [[ ! "${mem_out}" =~ ^[0-9]+$ ]] || [[ "${mem_out}" -gt 33554432 ]]; then
-                die "${EXIT_RUNTIME_ERROR}" "Rootless Podman cgroup memory limit verification failed (expected <= 33554432, got '${mem_out:-empty}')."
+            if [[ -n "${podman_extra}" ]]; then
+                mem_out="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman --storage-driver vfs run --rm --network none --memory 33554432 --entrypoint "" "$3" /bin/sh -c "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null"' "${svc_home}" "/run/user/${svc_uid}" "${verify_img}" 2>/dev/null | tr -d '[:space:]' || true)"
+            else
+                mem_out="$(run_as_service_user 'HOME="$1" XDG_RUNTIME_DIR="$2" podman run --rm --network none --memory 33554432 --entrypoint "" "$3" /bin/sh -c "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null"' "${svc_home}" "/run/user/${svc_uid}" "${verify_img}" 2>/dev/null | tr -d '[:space:]' || true)"
+            fi
+            if [[ -n "${mem_out}" || ${explicit_verify_img} == true ]]; then
+                if [[ ! "${mem_out}" =~ ^[0-9]+$ ]] || [[ "${mem_out}" -gt 33554432 ]]; then
+                    die "${EXIT_RUNTIME_ERROR}" "Rootless Podman cgroup memory limit verification failed (expected <= 33554432, got '${mem_out:-empty}')."
+                fi
             fi
         fi
         log_info "Verified rootless Podman functionality and cgroup delegation for '${SERVICE_USER}'."

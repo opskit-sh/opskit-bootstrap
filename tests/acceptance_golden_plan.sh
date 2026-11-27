@@ -53,6 +53,7 @@ test_golden_plan() {
     MOCK_APPARMOR_STATUS="enforcing" \
     MOCK_SELINUX_STATUS="absent" \
     OPSKIT_SKIP_DISK_CHECK="1" \
+    OPSKIT_SKIP_BIND_CHECK="1" \
     "${BOOTSTRAP_BIN}" --profile "${prof}" --no-probe --plan-json "${generated_file}" >/dev/null
 
     # Deep equality assertion against golden fixture (contractual plan conformance)
